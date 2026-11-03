@@ -604,7 +604,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         if (a7_layers.empty() || std::find(a7_layers.begin(), a7_layers.end(), il) == a7_layers.end()) {
             return false;
         }
-        if (!hparams.is_recr(il) || il == n_layer - 1 || il >= (int) a7_model.a7_ffn.size()) {
+        // [a7-ffn-fullattn] LLAMA_A7_FFN_FULLATTN=1: the ffn half of the full-attention layers is the same block (hc_mix, router, MoE,
+        // shared expert, hc_combine), so the listed full-attention layers take the op too (the q8 of R * hc_ffn_norm is made by its rquant kernel)
+        static const bool a7_ffn_fullattn = [] { const char * e = getenv("LLAMA_A7_FFN_FULLATTN"); return e && atoi(e) != 0; }();
+        if ((!hparams.is_recr(il) && !a7_ffn_fullattn) || il == n_layer - 1 || il >= (int) a7_model.a7_ffn.size()) {
             return false;
         }
         if (n_tokens != 4 || params.ubatch.n_seqs != 1 || n_outputs != 4 || params.gtype != LLM_GRAPH_TYPE_DEFAULT) {
