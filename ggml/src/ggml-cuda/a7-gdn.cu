@@ -23,6 +23,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <cuda_fp16.h>
+#include <algorithm>
+#include <vector>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -83,6 +86,10 @@ struct A7P {
   int kv_head, mem_size;
   float *qkv_o, *z_o, *a_o, *b_o;          // [4][10240] conv + silu output, [4][6144] z, [4][48] alpha, [4][48] beta (raw)
   int8_t *oq; float *od, *osq;             // q8 of the gated-norm input [4][6144], scales [4][192], sums of squares of o [4][192]
+  // [router-f16] GGML_A7_ROUTER_F16=1: F16 copy of ffn_gate_inp [512][2560] for the router stage (nullptr: the F32 tensor);
+  // =2 check mode: route with F32, also write the F16 logits to logits16 for a host-side comparison of the top-k sets
+  const __half *router16;
+  float *logits16;
 };
 
 extern __shared__ __align__(16) uint8_t g_dsm[];
@@ -285,6 +292,23 @@ static __device__ __noinline__ float f32_dot4(const float *w, const float *x, in
     for (int t = 0; t < T; t++) {
       const float4 xv = ((const float4 *)(x + t * D))[c];
       acc[t] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+    }
+  }
+  return rscatter<4>(acc, lane);
+}
+
+// [router-f16] F16 weights, F32 activations and accumulation; lane l returns the total of token (l & 3)
+static __device__ __noinline__ float f16_dot4(const __half *w, const float *x, int lane) {
+  float acc[T] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 2
+  for (int c = lane; c < D / 8; c += 32) {
+    const uint4 raw = __ldcs(((const uint4 *)w) + c);
+    const float2 f0 = __half22float2(*(const __half2 *)&raw.x), f1 = __half22float2(*(const __half2 *)&raw.y);
+    const float2 f2 = __half22float2(*(const __half2 *)&raw.z), f3 = __half22float2(*(const __half2 *)&raw.w);
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+      const float4 x0 = ((const float4 *)(x + t * D))[2 * c], x1 = ((const float4 *)(x + t * D))[2 * c + 1];
+      acc[t] += f0.x * x0.x + f0.y * x0.y + f1.x * x0.z + f1.y * x0.w + f2.x * x1.x + f2.y * x1.y + f3.x * x1.z + f3.y * x1.w;
     }
   }
   return rscatter<4>(acc, lane);
@@ -680,10 +704,19 @@ static __device__ __forceinline__ void stage_router(const A7P &P) {
   if (blockIdx.x == 0 && threadIdx.x == 0) P.cnt[3000] = 0;  // ticket counter of the next stage (gate/up)
   for (int item = gw; item < NEXP + 1 + 16; item += GW) {
     if (item <= NEXP) {
+      if (item < NEXP && P.router16 != nullptr && P.logits16 == nullptr) {  // [router-f16]
+        const float v = f16_dot4(P.router16 + (size_t)item * D, P.mixed, lane);
+        if (lane < T) P.logits[lane * NEXP + item] = v;
+        continue;
+      }
       const float v = f32_dot4(item < NEXP ? P.router + (size_t)item * D : P.sgw, P.mixed, lane);
       if (lane < T) {
         if (item < NEXP) P.logits[lane * NEXP + item] = v;
         else P.sgl[lane] = v;
+      }
+      if (item < NEXP && P.logits16 != nullptr) {  // [router-f16] check mode
+        const float v16 = f16_dot4(P.router16 + (size_t)item * D, P.mixed, lane);
+        if (lane < T) P.logits16[lane * NEXP + item] = v16;
       }
     } else {
       const int idx = item - NEXP - 1;
@@ -1814,6 +1847,62 @@ static int a7_tail_mode() {
   return m;
 }
 
+// [router-f16]
+static int a7_router_f16_mode() {
+  static const int m = [] { const char * e = getenv("GGML_A7_ROUTER_F16"); const int v = e ? atoi(e) : 0; if (v) fprintf(stderr, "A7: router F16 mode %d\n", v); return v; }();
+  return m;
+}
+static __global__ void a7_f32_to_f16(const float * src, __half * dst, size_t n) {
+  for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) dst[i] = __float2half_rn(src[i]);
+}
+static const __half * a7_router16_get(const float * src, int device) {
+  static std::mutex mutex;
+  static std::map<std::pair<const void *, int>, __half *> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = cache.find({src, device});
+  if (it != cache.end()) return it->second;
+  const size_t n = (size_t) a7ffn::NEXP * a7ffn::D;
+  __half * dst = nullptr;
+  cudaStream_t cs;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));  // private stream: never part of a captured graph
+  CUDA_CHECK(cudaMalloc(&dst, n * sizeof(__half)));
+  a7_f32_to_f16<<<160, 256, 0, cs>>>(src, dst, n);
+  CUDA_CHECK(cudaStreamSynchronize(cs));
+  CUDA_CHECK(cudaStreamDestroy(cs));
+  cache[{src, device}] = dst;
+  return dst;
+}
+static float * a7_logits16_get(int device) {
+  static float * buf[GGML_CUDA_MAX_DEVICES] = {};
+  if (!buf[device]) CUDA_CHECK(cudaMalloc(&buf[device], sizeof(float) * a7ffn::T * a7ffn::NEXP));
+  return buf[device];
+}
+// check mode: compare the top-10 expert sets of the F32 and F16 logits per token (needs the stream synchronized; run with graphs disabled)
+static void a7_router_check(const a7ffn::A7P & P, cudaStream_t st) {
+  using namespace a7ffn;
+  static std::mutex mutex;
+  static long n_tok = 0, n_set_diff = 0, n_order_diff = 0; static double max_d = 0, max_gap_hit = 0;
+  std::vector<float> a(T * NEXP), b(T * NEXP);
+  CUDA_CHECK(cudaMemcpyAsync(a.data(), P.logits, a.size() * 4, cudaMemcpyDeviceToHost, st));
+  CUDA_CHECK(cudaMemcpyAsync(b.data(), P.logits16, b.size() * 4, cudaMemcpyDeviceToHost, st));
+  CUDA_CHECK(cudaStreamSynchronize(st));
+  std::lock_guard<std::mutex> lock(mutex);
+  for (int t = 0; t < T; t++) {
+    std::vector<int> ia(NEXP), ib(NEXP);
+    for (int i = 0; i < NEXP; i++) { ia[i] = i; ib[i] = i; max_d = std::max(max_d, (double) fabsf(a[t * NEXP + i] - b[t * NEXP + i])); }
+    std::partial_sort(ia.begin(), ia.begin() + TOPK + 1, ia.end(), [&](int x, int y) { return a[t * NEXP + x] > a[t * NEXP + y]; });
+    std::partial_sort(ib.begin(), ib.begin() + TOPK, ib.end(), [&](int x, int y) { return b[t * NEXP + x] > b[t * NEXP + y]; });
+    std::set<int> sa(ia.begin(), ia.begin() + TOPK), sb(ib.begin(), ib.begin() + TOPK);
+    n_tok++;
+    if (sa != sb) { n_set_diff++; max_gap_hit = std::max(max_gap_hit, (double) (a[t * NEXP + ia[TOPK - 1]] - a[t * NEXP + ia[TOPK]])); }
+    else if (!std::equal(ia.begin(), ia.begin() + TOPK, ib.begin())) n_order_diff++;
+  }
+  if (n_tok % 4000 == 0) {
+    fprintf(stderr, "A7 router-check: tokens %ld, top-10 set differs %ld (%.4f%%), order only %ld, max |dlogit| %.3g, largest 10th-11th gap among misses %.3g\n",
+      n_tok, n_set_diff, 100.0 * n_set_diff / n_tok, n_order_diff, max_d, max_gap_hit);
+  }
+}
+
 template <int TH>
 static void a7_launch(const a7ffn::A7P & P, cudaStream_t st, int grid, int device, int rq_ready) {
   using namespace a7ffn;
@@ -1933,6 +2022,12 @@ void ggml_cuda_op_a7_gdn_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
   P.hcu_f = (const uint8_t *) L->hc_up->data;
   P.inj_f = (const float *) L->hc_inject->data;
   P.router = (const float *) L->gate_inp->data;
+  P.router16 = nullptr;
+  P.logits16 = nullptr;
+  if (a7_router_f16_mode() > 0) {  // [router-f16]
+    P.router16 = a7_router16_get(P.router, ctx.device);
+    if (a7_router_f16_mode() == 2) P.logits16 = a7_logits16_get(ctx.device);
+  }
   P.sgw = (const float *) L->gate_inp_shexp->data;
   P.eg = (const uint8_t *) L->gate_exps->data;
   P.eu = (const uint8_t *) L->up_exps->data;
@@ -1970,6 +2065,7 @@ void ggml_cuda_op_a7_gdn_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
   } else {
     a7_launch<384>(P, st, 72, ctx.device, rq_ready);
   }
+  if (P.logits16 != nullptr) a7_router_check(P, st);  // [router-f16] check mode
   // the work area now holds the q8 of the new R * hc_attn_norm of the next layer (when the down stage made it), else nothing valid
   if (P.norm_next != nullptr) {
     w->tag_il = il + 1;
