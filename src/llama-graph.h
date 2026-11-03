@@ -873,6 +873,24 @@ struct llm_graph_params {
                 return false;
             }
 
+            // [reuse-out-order] LLAMA_REUSE_OUT_ORDER=1: the sampler graph indexes the output rows by their order (logits are gathered through
+            // the out_ids input), so only the sequence of the output rows' seq ids has to match, not their positions in the ubatch
+            static const bool out_order = [] { const char * e = getenv("LLAMA_REUSE_OUT_ORDER"); return e && atoi(e) != 0; }();
+            if (out_order) {
+                uint32_t j = 0;
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    if (!ubatch.output[i]) {
+                        continue;
+                    }
+                    while (j < other.ubatch.n_tokens && !other.ubatch.output[j]) {
+                        ++j;
+                    }
+                    if (j >= other.ubatch.n_tokens || ubatch.seq_id[i][0] != other.ubatch.seq_id[j][0]) {
+                        return false;
+                    }
+                    ++j;
+                }
+            } else
             // check that the outputs are the same for all samplers
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 if (ubatch.output[i]    != other.ubatch.output[i] ||
