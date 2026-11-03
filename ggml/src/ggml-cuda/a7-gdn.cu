@@ -43,6 +43,7 @@ constexpr int IQ4ROW = 360;                // IQ4_NL row, K = 640
 constexpr int EXP_GU_BYTES = FF * IQ2ROW;      // IQ2_S gate (or up) of one expert: 524,800
 constexpr int EXP_D_BYTES = D * IQ4ROW;        // IQ4_NL down of one expert: 921,600
 constexpr int NCH = D / 32;                // 80 chunks of 32 columns
+constexpr int ACTB_GU = 26624;             // [gu512] gate/up at 512 threads: weight tiles right after the q8 activations, grid and scales (end at 25856)
 
 // the routing table (A7Route, T, NEXP, TOPK, MAXU, MAXP) and its builds are in a7-route.cuh
 
@@ -777,7 +778,7 @@ static __device__ __forceinline__ void stage_gateup(const A7P &P) {
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   constexpr int nwb = NTH / 32;
   const int gw = blockIdx.x * nwb + warp, GW = gridDim.x * nwb;
-  uint8_t *wtile = sm + ACTB + warp * TILEB;
+  uint8_t *wtile = sm + (NTH > 256 ? ACTB_GU : ACTB) + warp * TILEB;  // [gu512] 16 warps fit only with the tiles moved down
   uint2 *grid_s = (uint2 *)(sm + GRIDOFF);
   Q8Regs<NTH, T * D / 16, T * 80 / 4> qr;
   qr.load((const int4 *)P.mq, (const int4 *)P.md);
@@ -827,6 +828,25 @@ static __device__ __forceinline__ void stage_gateup(const A7P &P) {
         iq2s_decode_s(gt + m * 82, ib, grid_s, gg);
         iq2s_decode_s(ut + m * 82, ib, grid_s, gu);
         const int g = m * 8 + ib;
+        if constexpr (NTH > 256) {
+          // [gu512] exact IQ2_S scales (2 * sc + 1) / 8 applied in integer: one convert and one FMA per (row, token) instead of the
+          // truncating (s0 * sc0 + s1 * sc1 + (s0 + s1) / 2) / 4 and two multiplies
+          const int gl0 = 2 * (gg.sc & 0x0F) + 1, gl1 = 2 * (gg.sc >> 4) + 1, ul0 = 2 * (gu.sc & 0x0F) + 1, ul1 = 2 * (gu.sc >> 4) + 1;
+          const float gd = gg.d * 0.125f, ud = gu.d * 0.125f;
+#pragma unroll
+          for (int t = 0; t < T; t++) {
+            if ((mask >> t) & 1) {
+              const int4 a0 = xq[(t * 80 + g) * 2], a1 = xq[(t * 80 + g) * 2 + 1];
+              const float dy = xd[t * 80 + g];
+              int g0 = __dp4a(gg.gl[0], a0.x, 0); g0 = __dp4a(gg.gh[0], a0.y, g0); g0 = __dp4a(gg.gl[1], a0.z, g0); g0 = __dp4a(gg.gh[1], a0.w, g0);
+              int g1 = __dp4a(gg.gl[2], a1.x, 0); g1 = __dp4a(gg.gh[2], a1.y, g1); g1 = __dp4a(gg.gl[3], a1.z, g1); g1 = __dp4a(gg.gh[3], a1.w, g1);
+              int u0 = __dp4a(gu.gl[0], a0.x, 0); u0 = __dp4a(gu.gh[0], a0.y, u0); u0 = __dp4a(gu.gl[1], a0.z, u0); u0 = __dp4a(gu.gh[1], a0.w, u0);
+              int u1 = __dp4a(gu.gl[2], a1.x, 0); u1 = __dp4a(gu.gh[2], a1.y, u1); u1 = __dp4a(gu.gl[3], a1.z, u1); u1 = __dp4a(gu.gh[3], a1.w, u1);
+              ag[t] = fmaf(gd * dy, (float)(g0 * gl0 + g1 * gl1), ag[t]);
+              au[t] = fmaf(ud * dy, (float)(u0 * ul0 + u1 * ul1), au[t]);
+            }
+          }
+        } else {
 #pragma unroll
         for (int t = 0; t < T; t++) {
           if ((mask >> t) & 1) {
@@ -835,6 +855,7 @@ static __device__ __forceinline__ void stage_gateup(const A7P &P) {
             ag[t] += gg.d * dy * (float)iq2s_sumi(gg, a0, a1);
             au[t] += gu.d * dy * (float)iq2s_sumi(gu, a0, a1);
           }
+        }
         }
       }
       float v8[8] = {ag[0], ag[1], ag[2], ag[3], au[0], au[1], au[2], au[3]};
@@ -1820,7 +1841,21 @@ static void a7_launch(const a7ffn::A7P & P, cudaStream_t st, int grid, int devic
   a7_ffn_stage<TH, 6><<<gd, bl, dyn, st>>>(P);   // hc2f
   a7_ffn_stage<TH, 7><<<gd, bl, dyn, st>>>(P);   // router
   if (!P.route_inline) a7_ffn_route<<<1, 128, 0, st>>>(P);  // routing table (default: built in the router stage)
-  a7_ffn_stage<TH, 8><<<gd, bl, dyn, st>>>(P);   // gateup
+  static const bool gu512 = [] { const char * e = getenv("GGML_A7_GU512"); return e && atoi(e) != 0; }();
+  if (TH == 256 && gu512) {  // [gu512] 16 warps per SM for the compute-bound IQ2_S gate/up
+    constexpr size_t dyn512 = (size_t) ACTB_GU + 16 * TILEB;
+    static bool done512[GGML_CUDA_MAX_DEVICES] = {};
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!done512[device]) {
+        CUDA_CHECK(cudaFuncSetAttribute((const void *) a7_ffn_stage<512, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dyn512));
+        done512[device] = true;
+      }
+    }
+    a7_ffn_stage<512, 8><<<gd, dim3(512), dyn512, st>>>(P);
+  } else {
+    a7_ffn_stage<TH, 8><<<gd, bl, dyn, st>>>(P);   // gateup
+  }
   a7_ffn_stage<TH, 9><<<gd, bl, dyn, st>>>(P);   // qh
   a7_ffn_stage<TH, 10><<<gd, bl, dyn, st>>>(P);  // down + hc_combine(ffn)
   if (a7_tail_mode() == 1) a7_tail_l1<<<gd, 32, 0, st>>>();
