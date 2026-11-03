@@ -2,8 +2,8 @@
 
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) `v0.5.0` for
 **[Qwen3.8-Flash-Next-IQ3E-Q8D-MTP](https://huggingface.co/pentacoxian-dev/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-GGUF)**
-on **two V100 32 GB cards**, without NVLink. It covers MTP speculative decoding, image input and a 192K context, and runs
-on a host with 32 GB of RAM.
+on **two V100 32 GB cards**, without NVLink. It covers MTP speculative decoding, image input and the full 262K context,
+and runs on a host with 32 GB of RAM.
 
 This is not the official llama.cpp. Report problems with this fork here, not upstream. The upstream README is
 [`README.md`](../README.md); the work is on branch `qwen38-v100`.
@@ -35,9 +35,10 @@ cmake --build build -j --target llama-server
 
 hf download pentacoxian-dev/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-GGUF Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf --local-dir models
 hf download unsloth/Qwen3.8-Flash-Next-GGUF mmproj-F16.gguf --revision c8b5954 --local-dir models
+python3 deploy/qwen38-v100/tools/mmproj_q8.py models/mmproj-F16.gguf models/mmproj-Q8_0.gguf   # fits next to 262K
 
-QWEN38_MODEL=models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf QWEN38_MMPROJ=models/mmproj-F16.gguf \
-  deploy/qwen38-v100/run-server.sh          # OpenAI-compatible API on 127.0.0.1:18080/v1
+QWEN38_MODEL=models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf QWEN38_MMPROJ=models/mmproj-Q8_0.gguf \
+  deploy/qwen38-v100/run-server.sh          # 262K context + images; OpenAI-compatible API on 127.0.0.1:18080/v1
 ```
 
 [deploy/qwen38-v100/README.md](../deploy/qwen38-v100/README.md) covers the launcher options, every setting and switch, memory and VRAM headroom, the benchmarks and checks, and how to

@@ -1,16 +1,17 @@
 #!/bin/bash
 # qwen38-v100 launcher: llama-server for Qwen3.8-Flash-Next-IQ3E-Q8D-MTP on 2x V100 32 GB with the measured settings.
 # Required: QWEN38_MODEL (the .gguf). Optional (defaults below): QWEN38_MMPROJ, QWEN38_HOST, QWEN38_PORT, QWEN38_CTX,
-# QWEN38_IMAGE_MAX_TOKENS, QWEN38_CACHE_DIR, QWEN38_NUMA_NODE (empty = no binding), LLAMA_SERVER. Extra llama-server arguments: pass them to this script.
+# QWEN38_IMAGE_MAX_TOKENS (0 = no cap), QWEN38_CACHE_DIR, QWEN38_NUMA_NODE (empty = no binding), LLAMA_SERVER. Extra llama-server arguments: pass them to this script.
+# Default: 262K context; with QWEN38_MMPROJ set, use the Q8_0 projector made by tools/mmproj_q8.py (the F16 one does not fit at 262K).
 set -euo pipefail
 QWEN38_DEPLOY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$QWEN38_DEPLOY/../.." && pwd)"
 : "${QWEN38_MODEL:?set QWEN38_MODEL to Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf}"
 QWEN38_MMPROJ="${QWEN38_MMPROJ:-}"
-QWEN38_IMAGE_MAX_TOKENS="${QWEN38_IMAGE_MAX_TOKENS:-}"
+QWEN38_IMAGE_MAX_TOKENS="${QWEN38_IMAGE_MAX_TOKENS:-2048}"
 QWEN38_HOST="${QWEN38_HOST:-127.0.0.1}"
 QWEN38_PORT="${QWEN38_PORT:-18080}"
-QWEN38_CTX="${QWEN38_CTX:-196608}"
+QWEN38_CTX="${QWEN38_CTX:-262144}"
 QWEN38_CACHE_DIR="${QWEN38_CACHE_DIR:-$HOME/.cache/qwen38}"
 QWEN38_NUMA_NODE="${QWEN38_NUMA_NODE-0}"
 LLAMA_SERVER="${LLAMA_SERVER:-$REPO/build/bin/llama-server}"
@@ -20,9 +21,12 @@ set -a; . "$QWEN38_DEPLOY/qwen38.env"; set +a
 
 vision=()
 if [ -n "$QWEN38_MMPROJ" ]; then
-  vision=(--mmproj "$QWEN38_MMPROJ" --mmproj-device CUDA0)   # resident on CUDA0 (~0.9 GB + compute; images cap at ~4.1K tokens)
-  if [ -n "$QWEN38_IMAGE_MAX_TOKENS" ]; then
+  vision=(--mmproj "$QWEN38_MMPROJ" --mmproj-device CUDA0)   # resident on CUDA0
+  if [ "$QWEN38_IMAGE_MAX_TOKENS" != 0 ]; then
     vision+=(--image-max-tokens "$QWEN38_IMAGE_MAX_TOKENS")  # larger images are downscaled: bounds the vision compute buffer
+  fi
+  if [ "$QWEN38_CTX" -gt 196608 ] && [ "$(stat -c %s "$QWEN38_MMPROJ")" -gt 700000000 ]; then
+    echo "run-server.sh: warning: F16/BF16 projector above 192K context can run CUDA0 out of memory on large images; convert it with tools/mmproj_q8.py" >&2
   fi
 fi
 numa=()

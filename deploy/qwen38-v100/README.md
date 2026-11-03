@@ -1,7 +1,7 @@
 # qwen38-v100
 
 A llama.cpp fork for **Qwen3.8-Flash-Next-IQ3E-Q8D-MTP** on **two V100 32 GB cards** (sm_70, CUDA 12.x),
-with MTP speculative decoding, the vision encoder, and a 192K context. It runs on a host with 32 GB of RAM.
+with MTP speculative decoding, the vision encoder, and the full 262K context. It runs on a host with 32 GB of RAM.
 Maintained by pentaCoxian (pentacoxian-dev on Hugging Face). It replaces the patch files of the model repository.
 
 Much of the prefill speed comes from **Warabii1248**'s
@@ -45,14 +45,17 @@ cmake --build build -j --target llama-server
 hf download pentacoxian-dev/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP-GGUF Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf \
    --revision 75e6411f0157bb4b6d492a9868bc93c57d2b061c --local-dir models          # 85.9 GB
 hf download unsloth/Qwen3.8-Flash-Next-GGUF mmproj-F16.gguf --revision c8b5954 --local-dir models   # 0.9 GB, for images
+python3 deploy/qwen38-v100/tools/mmproj_q8.py models/mmproj-F16.gguf models/mmproj-Q8_0.gguf      # 613 MB, needs numpy
 ```
+
+The default 262K context needs the Q8_0 projector. The F16 one only fits at 192K; see below.
 
 ## Run
 
 ```sh
 QWEN38_MODEL=models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf \
-QWEN38_MMPROJ=models/mmproj-F16.gguf \
-deploy/qwen38-v100/run-server.sh            # OpenAI-compatible API on 127.0.0.1:18080/v1
+QWEN38_MMPROJ=models/mmproj-Q8_0.gguf \
+deploy/qwen38-v100/run-server.sh            # 262K context, images; OpenAI-compatible API on 127.0.0.1:18080/v1
 ```
 
 | Variable | Default | Meaning |
@@ -60,31 +63,27 @@ deploy/qwen38-v100/run-server.sh            # OpenAI-compatible API on 127.0.0.1
 | `QWEN38_MODEL` | required | the model GGUF |
 | `QWEN38_MMPROJ` | empty | vision projector. When set, it is loaded once onto CUDA0 and stays there |
 | `QWEN38_HOST`, `QWEN38_PORT` | `127.0.0.1`, `18080` | listen address |
-| `QWEN38_CTX` | `196608` | context size. For 262144 with vision, see below |
-| `QWEN38_IMAGE_MAX_TOKENS` | empty | cap on tokens per image. Larger images are downscaled |
+| `QWEN38_CTX` | `262144` | context size (the model's full window) |
+| `QWEN38_IMAGE_MAX_TOKENS` | `2048` | cap on tokens per image. Larger images are downscaled; `0` = no cap |
 | `QWEN38_CACHE_DIR` | `~/.cache/qwen38` | prompt-cache spill directory (`pc-disk/`). Give it a directory of its own |
 | `QWEN38_NUMA_NODE` | `0` | `numactl --cpunodebind` node, normally the one next to CUDA0. Set it empty to disable |
 | `LLAMA_SERVER` | `build/bin/llama-server` | binary |
 
 Any arguments after the script name are passed through to llama-server.
 
-### 262K context with vision
+### Why 262K with vision needs the Q8_0 projector and the image cap
 
 At 262144 tokens, the attention KV and the indexer buffers grow by about 0.5 GB on CUDA0 and 0.66 GB on CUDA1. With the
 F16 projector resident, a 4K image then fails to get its 478 MiB vision compute buffer on CUDA0. An image whose shape
-needs a new CUDA graph can also crash the server with out of memory in `cudaGraphInstantiate`. Two changes make room:
+needs a new CUDA graph can also crash the server with out of memory in `cudaGraphInstantiate`. The defaults make room:
 
-- **A Q8_0 projector.** `tools/mmproj_q8.py mmproj-F16.gguf mmproj-Q8_0.gguf` converts the 83 F16 matrices whose rows
-  are a multiple of 32 to Q8_0. The 4304-wide FFN-down matrices stay F16. Result: 904 -> 613 MB.
-- **`QWEN38_IMAGE_MAX_TOKENS=2048`.** A 1920x1080 image (2078 tokens) is barely changed. Larger images are downscaled
-  to about 2K tokens, so the vision compute buffer stays bounded.
+- **A Q8_0 projector.** `tools/mmproj_q8.py` converts the 83 F16 matrices whose rows are a multiple of 32 to Q8_0. The
+  4304-wide FFN-down matrices stay F16. Result: 904 -> 613 MB. `run-server.sh` warns when it is given a projector larger
+  than 700 MB above 192K.
+- **An image cap of 2048 tokens.** A 1920x1080 image (2078 tokens) is barely changed. Larger images are downscaled to
+  about 2K tokens, so the vision compute buffer stays bounded.
 
-```sh
-QWEN38_CTX=262144 QWEN38_MMPROJ=models/mmproj-Q8_0.gguf QWEN38_IMAGE_MAX_TOKENS=2048 \
-QWEN38_MODEL=models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf deploy/qwen38-v100/run-server.sh
-```
-
-What was measured with these settings:
+What was measured with these defaults:
 
 | Check | Result |
 |---|---|
@@ -94,13 +93,16 @@ What was measured with these settings:
 | Peak VRAM | CUDA0 32.26 GB, CUDA1 31.51 GB, of 32.77 GB |
 | Mixed decode benchmark | 22.73 ms per step (115.8 tok/s), the same as at 192K |
 
-Without vision, 262144 needs neither change.
+**Full-resolution images instead:** run at 192K with the F16 projector and no cap:
+`QWEN38_CTX=196608 QWEN38_MMPROJ=models/mmproj-F16.gguf QWEN38_IMAGE_MAX_TOKENS=0`. Images then use up to about 4.1K
+tokens (a 4K image takes 7.9 s), and CUDA0 peaks at 32.34 GB. **Without vision**, 262K needs neither change.
 
 ## Measured
 
 Two Tesla V100-SXM2-32GB cards, NVLink inactive, the GPUs on different NUMA nodes, Xeon E5-2680 v2, 200 W GPU power cap.
 These numbers come from this branch launched with `run-server.sh` and the settings in `qwen38.env`, using the scripts in
-`bench/`. Thinking was off except for the math task; each figure is the mean of 2 runs.
+`bench/`. Thinking was off except for the math task; each figure is the mean of 2 runs. The task table was measured
+at 192K; the mixed decode benchmark at 262K gives the same ms per step.
 
 | Task | Decode tok/s | MTP acceptance |
 |---|---:|---:|
@@ -119,16 +121,17 @@ These numbers come from this branch launched with `run-server.sh` and the settin
 - **Mixed benchmark** (`bench/bench.py`): 115.1 tok/s at 54.2% acceptance, 22.75 ms per verify step. The author's
   configuration measured 26.74 ms on the same machine.
 - **Prefill:** about 1,200 tok/s for prompts of 1-3K tokens, 2,433 tok/s at 34K and 2,558 tok/s at 142K.
-- **Images:** 1.1 s total for 640x360, 3.2 s for 1920x1080, 7.9 s at 4K. Images are capped at about 4.1K tokens, so 8K
-  inputs cost the same as 4K.
+- **Images:** 1.1-1.5 s total for 640x360 and 3.2-3.4 s for 1920x1080. With the default 2048-token cap, 4K and 8K
+  images are downscaled to about 2K tokens and take 3.3-4.2 s. At 192K without the cap, a 4K image takes 7.9 s, and 8K
+  inputs cost the same as 4K (the model caps them at about 4.1K tokens).
 - **Prompt cache:** appending a turn, regenerating, or editing the last message of a 24K-token chat re-prefills 4-81
   tokens and finishes in under 1 s. A 142K-token conversation pushed out of RAM comes back from disk in 3.8 s; prefilling
   it again would take 57 s.
 - **Host RAM:** peak anonymous memory was 5.6 GB in a stress run (142K + 34K + 34K documents, switching back, then an
   image). The 27.5 GB n-gram table and the 0.6 GB token embeddings are memory-mapped page cache, so the kernel can
   reclaim them. Keep `--load-mode mmap`: `mlock`, `none` and `dio` would pin the table or copy it into RAM.
-- **VRAM:** CUDA0 peaks at 32.34 of 32.77 GB with vision resident. Check this before raising the context or changing the
-  split.
+- **VRAM:** with the defaults (262K, Q8_0 projector, image cap), CUDA0 peaks at 32.26 of 32.77 GB. Check this before
+  you change the split, the ubatch or the vision settings.
 
 ## Settings that differ from the upstream measured config
 
@@ -138,6 +141,7 @@ These numbers come from this branch launched with `run-server.sh` and the settin
 | `--batch-size 3072` (upstream 15360) | faster prefill (2,077 -> 2,433 tok/s at 34K). Context checkpoints are taken only between batches, so a change inside one long message now re-prefills at most ~2.5K tokens instead of ~12K |
 | `--cache-ram 4096`, `--ctx-checkpoints 24`, `--checkpoint-min-step 2048`, `LLAMA_PROMPT_CACHE_DISK` | keeps a 32 GB host within bounds; older conversations spill to disk |
 | Vision resident on CUDA0 (`MTMD_ON_DEMAND` removed) | about 0.65 s faster per image, text speed unchanged |
+| 262K context with the Q8_0 projector and `--image-max-tokens 2048` (upstream measured 192K) | the full context with vision resident; see the 262K section under Run |
 | `LLAMA_MTP_DRAFT_VOCAB=draftvocab-64k-ml.txt` | 64K-row draft head built from the model's own English, code, Japanese, Chinese and Korean output, and from local corpora (`tools/mkvocab*.py`). A list without CJK tokens costs Japanese about 20% |
 | `LLAMA_MTP_PAD=4` with `LLAMA_REUSE_OUT_ORDER=1` | a constant draft batch shape: half as many draft-graph rebuilds |
 | `GGML_A7_GU512`, `GGML_A7_ROUTER_F16`, `LLAMA_A7_FFN_FULLATTN` | this fork's kernel and graph changes, about 1.2 ms per step together |
