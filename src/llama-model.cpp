@@ -421,6 +421,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
     static const std::regex pattern_output_weight("output\\.weight");
+    static const std::regex pattern_nextn_head   ("blk\\.\\d*\\.nextn\\.shared_head_head\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
     struct tensor_config {
@@ -496,6 +497,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
+        }
+
+        // shared experts: split like the routed experts, so their partial sum joins the MoE AllReduce
+        if (is_dsv4 || ud->model->arch == LLM_ARCH_QWEN4EXP) {
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
@@ -590,6 +595,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+        }
+        // the MTP draft head: split by vocab like output.weight (its logits are read back like the target's)
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP && std::regex_match(tensor_name, pattern_nextn_head)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
@@ -800,8 +809,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
+            // an even share the rounding would break up (640 on 4 devices: 128/128/128/256, and whichever device
+            // holds 256 sets the pace of every layer) is split at a finer multiple of the block size instead
+            static const bool keep_128 = getenv("LLAMA_SPLIT_FFN_128") != nullptr;
+            while (!keep_128 && segments[0].first % (blck_size_perf*(int64_t) ud->n_devices) != 0 &&
+                    blck_size_perf % 2 == 0 && (blck_size_perf/2) % blck_size == 0) {
+                blck_size_perf /= 2;
+            }
             return {blck_size_perf};
         }
 
@@ -2589,6 +2605,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                        filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        filter_idx = filter_attn;
+                        filter_recr = [&](uint32_t) { return false; };
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
@@ -2767,6 +2789,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add backend sampling layers (if any)
     llm->build_sampling();
+
+    // device-side greedy argmax (if enabled)
+    llm->build_argmax();
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers

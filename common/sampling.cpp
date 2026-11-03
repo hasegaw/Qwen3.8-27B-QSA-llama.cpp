@@ -591,6 +591,36 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// Greedy sampling whose chain cannot move the maximum reduces to an argmax over the logits: the
+// temperature stage keeps only the largest logit, and nothing configured here can reorder or remove
+// it. Scanning the logits directly skips building (and partially sorting) a candidate array over
+// the whole vocabulary, which costs about a millisecond per token for a 248K vocabulary.
+static bool common_sampler_greedy_eligible(const common_sampler * gsmpl) {
+    static const bool disabled = [] {
+        const char * env = getenv("LLAMA_SAMPLER_NO_GREEDY_FAST");
+        return env && atoi(env) != 0;
+    }();
+    const auto & p = gsmpl->params;
+    if (disabled || !(p.temp <= 0.0f) || p.mirostat != 0 || p.n_probs > 0 || !p.logit_bias.empty() || gsmpl->grmr) {
+        return false;
+    }
+    if (p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f)) {
+        return false;
+    }
+    if (p.dry_multiplier != 0.0f && p.dry_penalty_last_n != 0) {
+        return false;
+    }
+    if (p.xtc_probability > 0.0f && p.xtc_threshold <= 0.5f) {
+        return false;
+    }
+    for (const auto s : p.samplers) {
+        if (s == COMMON_SAMPLER_TYPE_INFILL || s == COMMON_SAMPLER_TYPE_ADAPTIVE_P) {
+            return false;
+        }
+    }
+    return true;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -598,6 +628,59 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     const auto tm = gsmpl->tm();
 
     llama_token id = LLAMA_TOKEN_NULL;
+
+    if (common_sampler_greedy_eligible(gsmpl) &&
+            llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
+            llama_get_sampled_logits_ith(ctx, idx) == nullptr && llama_get_sampled_probs_ith(ctx, idx) == nullptr) {
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+
+        // the model's suppressed tokens carry a -inf bias in the chain
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+
+        llama_token best = -1;
+        float best_logit = -INFINITY;
+
+        // the device already picked the token (LLAMA_GPU_ARGMAX): no logits copy, no scan.
+        // Only without suppressed tokens, which the device argmax does not know about.
+        const llama_token device_best = n_suppress == 0 ? llama_get_argmax_ith(ctx, idx) : LLAMA_TOKEN_NULL;
+        if (device_best != LLAMA_TOKEN_NULL) {
+            best       = device_best;
+            best_logit = 0.0f; // not needed by greedy callers
+        } else {
+            const float * logits = llama_get_logits_ith(ctx, idx);
+            GGML_ASSERT(logits != nullptr);
+            for (llama_token t = 0; t < n_vocab; ++t) {
+                if (logits[t] > best_logit) {
+                    bool suppressed = false;
+                    for (int32_t i = 0; i < n_suppress; ++i) {
+                        suppressed |= suppress[i] == t;
+                    }
+                    if (!suppressed) {
+                        best = t;
+                        best_logit = logits[t];
+                    }
+                }
+            }
+        }
+
+        bool ok = best >= 0;
+        if (ok && gsmpl->rbudget) {
+            // a reasoning budget that is forcing a token rejects everything else: fall back if so
+            llama_token_data       single       = { best, best_logit, 0.0f };
+            llama_token_data_array single_array = { &single, 1, -1, false };
+            llama_sampler_apply(gsmpl->rbudget, &single_array);
+            ok = single_array.data[0].logit != -INFINITY;
+        }
+
+        if (ok) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{ best, best_logit, 1.0f };
+            gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, true };
+            return best;
+        }
+    }
 
     auto & grmr  = gsmpl->grmr;
     auto & rbudget = gsmpl->rbudget;

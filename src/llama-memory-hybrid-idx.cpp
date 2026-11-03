@@ -11,6 +11,13 @@
 #include <cmath>
 #include <iterator>
 #include <stdexcept>
+#include <cstdlib>
+
+static bool qsa_blk_debug() {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_QSA_BLK_DEBUG"); return e && atoi(e) != 0; }();
+    return enabled;
+}
+#define QSA_BLK_INVALIDATE(why) do { if (blk_valid && qsa_blk_debug()) { LLAMA_LOG_INFO("qsa-blk: layout invalidated by %s\n", why); } blk_valid = false; } while (0)
 
 //
 // llama_memory_hybrid_idx
@@ -65,7 +72,34 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        has_recurrent |= model.hparams.is_recr(il) && (!filter_recr || filter_recr(il));
+    }
+
+    if (mem_idx) {
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (filter_idx(il)) {
+                blk_ratio = std::max(blk_ratio, model.hparams.dsv4_compress_ratios[il]);
+            }
+        }
+    }
+
+    if (mem_idx && blk_ratio > 0 && n_seq_max == 1) {
+        hparams_blk = hparams_idx;
+
+        // one row per block plus a scratch row for padded updates
+        const uint32_t n_pad_blk = std::max<uint32_t>(n_pad, 1);
+        const uint32_t size_blk  = GGML_PAD(kv_size/blk_ratio + 1, n_pad_blk);
+
+        LLAMA_LOG_INFO("%s: creating pooled indexer key cache, size = %u blocks\n", __func__, size_blk);
+
+        mem_blk.reset(new llama_kv_cache(
+            model, hparams_blk, GGML_TYPE_F32, GGML_TYPE_F32, false, offload, unified,
+            size_blk, n_seq_max, n_pad_blk, 0, LLAMA_SWA_TYPE_NONE,
+            nullptr, filter_idx, nullptr, nullptr, "blk_"));
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -146,11 +180,15 @@ void llama_memory_hybrid_idx::clear(bool data) {
     if (mem_idx) {
         mem_idx->clear(data);
     }
+
+    // an empty cache is trivially laid out by position; blocks are rebuilt as they fill
+    blk_valid = true;
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
-    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+    // An attention-only draft has bookkeeping cells but no recurrent state to restore.
+    if (!get_mem_recr()->seq_rm(seq_id, has_recurrent ? p0 : -1, has_recurrent ? p1 : -1)) {
         return false;
     }
 
@@ -158,11 +196,31 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
-    return get_mem_attn()->seq_rm(seq_id, p0, p1);
+    const bool res = get_mem_attn()->seq_rm(seq_id, p0, p1);
+
+    // removal keeps every remaining cell at its position; a later misplaced insert is caught
+    // when its ubatch is applied. Emptying the cache makes the layout valid again.
+    if (res && get_mem_attn()->seq_pos_max(seq_id < 0 ? 0 : seq_id) < 0 && (seq_id <= 0)) {
+        if (!blk_valid && qsa_blk_debug()) {
+            LLAMA_LOG_INFO("qsa-blk: layout valid again (cache emptied)\n");
+        }
+        blk_valid = true;
+    }
+
+    return res;
+}
+
+llama_pos llama_memory_hybrid_idx::seq_pos_min(llama_seq_id seq_id) const {
+    return has_recurrent ? llama_memory_hybrid::seq_pos_min(seq_id) : get_mem_attn()->seq_pos_min(seq_id);
+}
+
+llama_pos llama_memory_hybrid_idx::seq_pos_max(llama_seq_id seq_id) const {
+    return has_recurrent ? llama_memory_hybrid::seq_pos_max(seq_id) : get_mem_attn()->seq_pos_max(seq_id);
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    QSA_BLK_INVALIDATE("seq_cp");
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -171,6 +229,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     llama_memory_hybrid::seq_keep(seq_id);
+    QSA_BLK_INVALIDATE("seq_keep");
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
@@ -179,6 +238,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
+    QSA_BLK_INVALIDATE("seq_add");
 
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
@@ -187,6 +247,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
+    QSA_BLK_INVALIDATE("seq_div");
 
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
@@ -198,6 +259,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 
     if (mem_idx) {
         for (const auto & buft_size : mem_idx->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
+
+    if (mem_blk) {
+        for (const auto & buft_size : mem_blk->memory_breakdown()) {
             mb[buft_size.first] += buft_size.second;
         }
     }
@@ -221,6 +288,12 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
+
+    // pooled block keys are not part of the saved state; a partial (recurrent-only) restore,
+    // as the server's context checkpoints use, leaves the attention and indexer cells alone
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        QSA_BLK_INVALIDATE("state_read");
+    }
 
     // [TAG_HYBRID_IDX_SINFO]
     // the indexer restore adopts the attention cache's layout instead of searching for cells of its own
@@ -268,6 +341,10 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+llama_kv_cache * llama_memory_hybrid_idx::get_mem_blk() const {
+    return mem_blk.get();
 }
 
 void llama_memory_hybrid_idx::set_input_qsa(
@@ -417,8 +494,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         group_cells();
 
-        // mrope repeats one position across an image, so rank cells instead of using the position
-        if (dup && ubatch->is_pos_2d() && one_seq) {
+        // rank cells instead of using the position when positions do not number the cells:
+        // - mrope repeats one position across an image;
+        // - a context that skipped an image's embeddings (the MTP draft context) keeps the target's positions, which
+        //   jump past the image and so run ahead of its cells, beyond the cell window
+        if (((dup && ubatch->is_pos_2d()) || oor) && one_seq) {
             order.clear();
             order.reserve(n_kv);
 
@@ -429,7 +509,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
 
             // same total order the mrope causal mask uses: pos, then ext.y, then ext.x
-            std::sort(order.begin(), order.end(), [&cells](int32_t a, int32_t b) {
+            const auto before = [&cells](int32_t a, int32_t b) {
                 const llama_pos pa = cells.pos_get(a);
                 const llama_pos pb = cells.pos_get(b);
 
@@ -440,7 +520,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 const auto & ea = cells.ext_get(a);
 
                 return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
-            });
+            };
+
+            // one sequence written in order leaves its cells sorted already: O(n_kv) instead of a sort per ubatch
+            if (!std::is_sorted(order.begin(), order.end(), before)) {
+                std::sort(order.begin(), order.end(), before);
+            }
 
             rank.assign(n_kv, -1);
 
@@ -518,9 +603,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
             int64_t q = ubatch->pos[i];
 
             if (ranked) {
+                const bool      q2 = ubatch->is_pos_2d();
                 const llama_pos qt = ubatch->pos[i];
-                const llama_pos qy = ubatch->pos[i + n_tokens];
-                const llama_pos qx = ubatch->pos[i + n_tokens*2];
+                const llama_pos qy = q2 ? ubatch->pos[i + n_tokens]   : 0;
+                const llama_pos qx = q2 ? ubatch->pos[i + n_tokens*2] : 0;
 
                 int64_t lo = 0;
                 int64_t hi = (int64_t) order.size();
@@ -652,11 +738,37 @@ bool llama_memory_hybrid_idx_context::next() {
 bool llama_memory_hybrid_idx_context::apply() {
     bool res = llama_memory_hybrid_context::apply();
 
+    // a token placed anywhere but in the next cell invalidates the pooled block keys
+    if (mem && mem->get_mem_blk() && mem->get_blk_valid() && ctx_idx &&
+        get_attn()->has_ubatch() && !get_attn()->ubatch_cells_follow()) {
+        if (qsa_blk_debug()) {
+            const auto & ub = get_attn()->get_ubatch();
+            LLAMA_LOG_INFO("qsa-blk: layout invalidated by a misplaced ubatch (n_tokens=%u, pos0=%d)\n", ub.n_tokens, ub.n_tokens ? ub.pos[0] : -1);
+        }
+        mem->set_blk_valid(false);
+    }
+
     if (ctx_idx) {
         res = res & ctx_idx->apply();
     }
 
     return res;
+}
+
+llama_kv_cache * llama_memory_hybrid_idx_context::get_blk() const {
+    return mem ? mem->get_mem_blk() : nullptr;
+}
+
+bool llama_memory_hybrid_idx_context::blk_ok() const {
+    if (get_blk() == nullptr || !mem->get_blk_valid() || !get_attn()->ubatch_cells_follow()) {
+        return false;
+    }
+    // the pooled blocks name cells of both caches, so they must agree; if they do not, the layout is gone for good
+    if (get_idx() == nullptr || !get_idx()->ubatch_cells_follow() || get_attn()->ubatch_cell0() != get_idx()->ubatch_cell0()) {
+        mem->set_blk_valid(false);
+        return false;
+    }
+    return true;
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {

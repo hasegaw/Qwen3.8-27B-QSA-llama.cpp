@@ -94,6 +94,9 @@ struct llama_cross {
 
 struct llm_graph_params;
 
+// LLAMA_GPU_ARGMAX=1: see llm_graph_context::build_argmax
+bool llama_gpu_argmax_enabled();
+
 //
 // llm_graph_input
 //
@@ -681,6 +684,10 @@ public:
     llm_graph_input_attn_kv * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs      * get_recr() const { return inp_rs.get(); }
 
+    // false if the graph reads no recurrent state (e.g. an MTP head): then the recurrent slot
+    //     (head, rs_z) does not change the graph and does not block its reuse
+    bool uses_recr = true;
+
     const llama_cparams cparams;
 
     const llama_memory_hybrid_context * mctx;
@@ -781,6 +788,11 @@ struct llm_graph_params {
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
+
+    // GPU-resident MoE expert cache, or null. Constant for the life of the context, so it
+    // does not participate in graph-reuse comparisons.
+    class llama_moe_cache * moe_cache;
+    class llama_ft_moe * ft_moe = nullptr;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
@@ -898,6 +910,7 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
+    ggml_tensor * get_argmax()      const { return t_argmax; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
@@ -933,6 +946,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_argmax      = nullptr; // greedy token per output row, computed on the device (LLAMA_GPU_ARGMAX)
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1022,6 +1036,16 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
+    class llama_ft_moe * ft_moe = nullptr;
+    class llama_moe_cache * moe_cache = nullptr; // GPU-resident expert cache, or null
+
+    // Which half of the expert-cache split is currently being emitted: 0 = build both as one
+    // pass (the uncached shape), 1 = VRAM hits only, 2 = host misses only. The two halves are
+    // emitted as whole FFNs so the graph holds one contiguous run of GPU nodes followed by one
+    // of CPU nodes; splitting per matmul instead alternates backends six times per layer and
+    // the synchronisation costs far more than the cache saves.
+    mutable int moe_chain = 0;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -1056,6 +1080,12 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // MoE expert cache: hits from VRAM + misses from host, or nullptr when not cached
+    ggml_tensor * build_moe_cached_mm_id(
+            ggml_tensor * w,
+            ggml_tensor * cur,
+            ggml_tensor * ids) const;
+
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
@@ -1375,6 +1405,9 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    // LLAMA_GPU_ARGMAX=1: argmax of every logits row on the device, so greedy sampling needs no logits copy
+    void build_argmax() const;
 
     //
     // dense (out)

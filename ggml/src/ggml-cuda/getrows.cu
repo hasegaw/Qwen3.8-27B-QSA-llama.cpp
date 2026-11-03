@@ -439,7 +439,44 @@ void get_rows_cuda(
     }
 }
 
+// Q8_0 rows gathered straight into F16: one block per row, each thread expanding whole 32-value blocks.
+// The generic dequantizing gather spends most of its time on index math for a few values per thread.
+static __global__ void k_get_rows_q8_0_f16(
+        const char * __restrict__ src0, const int32_t * __restrict__ src1, half * __restrict__ dst,
+        const int64_t nblk, const size_t nb01, const size_t s10, const size_t nb1) {
+    const int64_t i10 = blockIdx.x;
+    const int64_t row = src1[i10*s10];
+    const block_q8_0 * x = (const block_q8_0 *) (src0 + row*nb01);
+    half2 * y = (half2 *) ((char *) dst + i10*nb1);
+    // each thread does a quarter block: 8 values
+    for (int64_t t = threadIdx.x; t < nblk*4; t += blockDim.x) {
+        const int64_t ib = t >> 2;
+        const int     iq = (t & 3) * 8;
+        const float   d  = __half2float(x[ib].d);
+        const int8_t * q = x[ib].qs + iq;
+        half2 * yb = y + (ib*QK8_0 + iq)/2;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            yb[k] = __floats2half2_rn(d*q[2*k], d*q[2*k + 1]);
+        }
+    }
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    {
+        static const bool generic_only = getenv("GGML_CUDA_GET_ROWS_GENERIC") != nullptr;
+        const ggml_tensor * src0 = dst->src[0];
+        const ggml_tensor * src1 = dst->src[1];
+        if (!generic_only && src0->type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_I32 &&
+                src1->ne[1] == 1 && src1->ne[2] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+                src0->ne[0] % QK8_0 == 0 && dst->nb[1] % 4 == 0) {
+            k_get_rows_q8_0_f16<<<src1->ne[0], 128, 0, ctx.stream()>>>(
+                (const char *) src0->data, (const int32_t *) src1->data, (half *) dst->data,
+                src0->ne[0]/QK8_0, src0->nb[1], src1->nb[0]/sizeof(int32_t), dst->nb[1]);
+            return;
+        }
+    }
+
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 

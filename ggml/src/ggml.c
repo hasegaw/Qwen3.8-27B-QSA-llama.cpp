@@ -1099,9 +1099,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ALLREDUCE",
+    "ARGMAX_SPLIT",
+    "HC_FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1218,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "allreduce(x)",
+    "argmax_split(x)",
+    "hc_fused(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2543,6 +2551,110 @@ struct ggml_tensor * ggml_argmax(
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, a->ne[1]);
 
     result->op     = GGML_OP_ARGMAX;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_hc_mix_down, ggml_hc_mix_up, ggml_hc_combine
+
+struct ggml_tensor * ggml_hc_mix_down(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_inject,
+        float                 eps) {
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[3] == 1);
+    GGML_ASSERT(w_norm->type == GGML_TYPE_F32 && w_norm->ne[0] == n_embd && w_norm->ne[1] == hc && ggml_is_contiguous(w_norm));
+    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0 && w_down->ne[0] == n_embd*hc);
+    GGML_ASSERT(n_embd % 512 == 0);
+    if (w_inject) {
+        GGML_ASSERT(w_inject->type == GGML_TYPE_F32 && w_inject->ne[0] == n_embd*hc && w_inject->ne[1] == hc);
+    }
+    const int64_t lr = w_down->ne[1];
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, lr + 2*hc, T);
+    int32_t params[2] = { 0, 0 }; // mode, eps
+    memcpy(&params[1], &eps, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_HC_FUSED;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = w_down;
+    result->src[3] = w_inject;
+    return result;
+}
+
+struct ggml_tensor * ggml_hc_mix_up(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * w_up,
+        struct ggml_tensor  * down) {
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(w_up->type == GGML_TYPE_Q8_0 && w_up->ne[1] == n_embd*hc);
+    const int64_t lr = w_up->ne[0];
+    GGML_ASSERT(down->type == GGML_TYPE_F32 && down->ne[0] == lr + 2*hc && down->ne[1] == T && ggml_is_contiguous(down));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+    int32_t params[2] = { 1, 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_HC_FUSED;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = w_up;
+    result->src[3] = down;
+    return result;
+}
+
+struct ggml_tensor * ggml_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * down) {
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t T      = x->ne[2];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32 && block_out->ne[0] == n_embd && block_out->ne[1] == T && ggml_is_contiguous(block_out));
+    GGML_ASSERT(down->type == GGML_TYPE_F32 && (down->ne[0] == hc || down->ne[0] >= 2*hc) && down->ne[1] == T && ggml_is_contiguous(down));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, T);
+    // mode, first inject row: a plain [hc, T] inject or the ggml_hc_mix_down layout
+    int32_t params[2] = { 2, (int32_t) (down->ne[0] == hc ? 0 : down->ne[0] - 2*hc) };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_HC_FUSED;
+    result->src[0] = x;
+    result->src[1] = block_out;
+    result->src[2] = down;
+    return result;
+}
+
+// ggml_argmax_split
+
+struct ggml_tensor * ggml_argmax_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_dev) {
+    GGML_ASSERT(ggml_is_matrix(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] <= (1 << 24)); // indices are stored as floats
+    GGML_ASSERT(n_dev >= 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_dev, a->ne[1]);
+
+    // n_dev, rank, column offset of the slice, partial: the meta backend sets the last three per device
+    const int32_t params[4] = { n_dev, 0, 0, 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ARGMAX_SPLIT;
     result->src[0] = a;
 
     return result;

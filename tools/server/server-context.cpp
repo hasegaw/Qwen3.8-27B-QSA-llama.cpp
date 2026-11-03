@@ -36,6 +36,39 @@
 #include <windows.h>
 #endif
 
+
+// LLAMA_SPEC_TIMING=1: host time per speculative-loop phase, averaged over update_slots calls
+struct spec_phase_timing {
+    int64_t t[16] = {0};
+    int64_t n = 0;
+    static bool enabled() {
+        static const bool e = [] { const char * v = getenv("LLAMA_SPEC_TIMING"); return v && atoi(v) != 0; }();
+        return e;
+    }
+    void report() {
+        static const char * names[16] = { "total", "tgt_decode", "spec_process", "accept", "draft", "pre_draft", "render", "rest", "ckpt",
+                                          "a_clone", "a_sample", "a_post", "a_emit", "b_last", "b_prompts", "b_lora_etc" };
+        if (++n % 200 != 0) return;
+        t[7] = t[0];
+        for (int i = 1; i < 9; ++i) { if (i != 7) t[7] -= t[i]; }
+        std::string line;
+        for (int i = 0; i < 16; ++i) { line += string_format(" %s=%.0f", names[i], t[i]/200.0); t[i] = 0; }
+        LOG_INF("spec-timing avg_us:%s\n", line.c_str());
+    }
+};
+static spec_phase_timing g_spec_timing;
+static int64_t g_spec_mark = 0;
+// adds the time since mark to phase idx and moves the mark
+static void spec_phase_lap(int idx, int64_t & mark) {
+    if (spec_phase_timing::enabled()) { const int64_t t = ggml_time_us(); g_spec_timing.t[idx] += t - mark; mark = t; }
+}
+struct spec_phase_scope {
+    int idx; int64_t t0;
+    spec_phase_scope(int idx) : idx(idx), t0(spec_phase_timing::enabled() ? ggml_time_us() : 0) {}
+    ~spec_phase_scope() { if (spec_phase_timing::enabled()) g_spec_timing.t[idx] += ggml_time_us() - t0; }
+};
+
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -2791,6 +2824,12 @@ private:
 #endif
 
     void update_slots() {
+        const int64_t spec_t0 = spec_phase_timing::enabled() ? ggml_time_us() : 0;
+        struct spec_total_guard {
+            int64_t t0;
+            ~spec_total_guard() { if (spec_phase_timing::enabled()) { g_spec_timing.t[0] += ggml_time_us() - t0; g_spec_timing.report(); } }
+        } spec_total_guard_{spec_t0};
+        g_spec_mark = spec_t0;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2834,7 +2873,9 @@ private:
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
+            spec_phase_lap(14, g_spec_mark);
             batch.render();
+            spec_phase_lap(6, g_spec_mark);
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -3040,12 +3081,15 @@ private:
             }
         });
 
+        spec_phase_lap(5, g_spec_mark);
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                spec_phase_scope spec_scope_draft(4);
                 common_speculative_draft(spec.get());
             });
         }
+        if (spec_phase_timing::enabled()) { g_spec_mark = ggml_time_us(); }
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
@@ -3095,10 +3139,12 @@ private:
             }
         });
 
+        spec_phase_lap(8, g_spec_mark);
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        spec_phase_lap(13, g_spec_mark);
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3678,6 +3724,8 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        spec_phase_lap(15, g_spec_mark);
+        spec_phase_scope spec_scope_decode(1);
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
@@ -3744,6 +3792,7 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                spec_phase_scope spec_scope_process(2);
                 ok = common_speculative_process(spec.get(), batch_view);
             });
 
@@ -3908,7 +3957,10 @@ private:
 
             // verify and try to accept the draft
             {
+                spec_phase_scope spec_scope_accept(3);
+                int64_t acc_mark = spec_phase_timing::enabled() ? ggml_time_us() : 0;
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                spec_phase_lap(9, acc_mark);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
@@ -3918,6 +3970,7 @@ private:
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 slot.spec_i_batch.clear();
+                spec_phase_lap(10, acc_mark);
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -3933,6 +3986,9 @@ private:
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
+
+                        // Record the original result; replay must not credit the replacement token.
+                        common_speculative_accept_feedback(spec.get(), slot.id, accepted.size() - 1);
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
@@ -3966,6 +4022,7 @@ private:
                 slot.spec_draft = std::move(accepted);
             }
 
+            int64_t post_mark = spec_phase_timing::enabled() ? ggml_time_us() : 0;
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
@@ -3996,6 +4053,7 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            spec_phase_lap(11, post_mark);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -4018,6 +4076,7 @@ private:
             }
 
             slot.print_timings_tg();
+            spec_phase_lap(12, post_mark);
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });

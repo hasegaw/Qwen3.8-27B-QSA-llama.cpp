@@ -402,15 +402,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        // the cells of seq_id in [p0, p1) come straight from its position index, so trimming a few
+        // trailing tokens (speculative rollback) does not scan every cell of a long context
+        std::vector<uint32_t> idxs;
+        cells.seq_cells_in(seq_id, p0, p1, idxs);
+        for (const uint32_t i : idxs) {
+            if (cells.seq_rm(i, seq_id)) {
+                new_head = std::min(new_head, i);
             }
         }
 
@@ -2786,6 +2784,45 @@ ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) cons
 
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
     kv->set_input_k_shift(dst);
+}
+
+bool llama_kv_cache_context::ubatch_cells_follow() const {
+    if (!has_ubatch()) {
+        return false;
+    }
+    const auto & sinfo  = sinfos[i_cur];
+    const auto & ubatch = ubatches[i_cur];
+    if (sinfo.n_stream() != 1 || sinfo.strm[0] != 0 || sinfo.size() == 0 || ubatch.n_tokens == 0) {
+        return false;
+    }
+    const uint32_t c0 = sinfo.idxs[0][0];
+    for (uint32_t i = 1; i < sinfo.size(); ++i) {
+        if (sinfo.idxs[0][i] != c0 + i) {
+            return false;
+        }
+    }
+    // every used cell lies below the ubatch's end and none is missing
+    const auto & cells = kv->get_cells(ubatch.seq_id[0][0]);
+    const uint32_t end = c0 + sinfo.size();
+    return cells.used_max_p1() == end && cells.get_used() == end;
+}
+
+uint32_t llama_kv_cache_context::ubatch_cell0() const {
+    GGML_ASSERT(has_ubatch() && sinfos[i_cur].size() > 0);
+    return sinfos[i_cur].idxs[0][0];
+}
+
+void llama_kv_cache_context::cell_rope_pos(uint32_t i, int32_t * sec) const {
+    GGML_ASSERT(has_ubatch());
+    const auto & cells = kv->get_cells(ubatches[i_cur].seq_id[0][0]);
+    const llama_pos p = cells.pos_get(i);
+    const auto &    e = cells.ext_get(i);
+    // a cell never given 2d positions stores zeros there: a 1d position then fills every section
+    const bool is_2d = e.x != 0 || e.y != 0 || p == 0;
+    sec[0] = p;
+    sec[1] = is_2d ? e.y : p;
+    sec[2] = is_2d ? e.x : p;
+    sec[3] = p;
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
+#include "llama-moe-cache.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -228,6 +229,23 @@ private:
 
     void output_reorder();
 
+    // LLAMA_GPU_ARGMAX: logits rows whose device-to-host copy is deferred until someone reads them
+    struct logits_pending_copy {
+        ggml_tensor *  t;
+        ggml_backend_t backend;
+        float *        dst;
+        size_t         nbytes;
+    };
+    std::vector<logits_pending_copy> logits_pending;
+    std::vector<int32_t>             argmax_ids; // per output row, -1 when not computed
+    void logits_flush(bool sync);
+
+public:
+    // greedy token of output i computed on the device, or LLAMA_TOKEN_NULL
+    llama_token get_argmax_ith(int32_t i);
+
+private:
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -347,6 +365,10 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // GPU-resident cache for host-offloaded MoE experts (null when --moe-expert-cache is 0)
+    std::unique_ptr<llama_moe_cache> moe_cache;
+    std::unique_ptr<class llama_ft_moe> ft_moe;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -373,6 +395,9 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // false while work enqueued on the backends may still be running (see synchronize())
+    bool synced = true;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

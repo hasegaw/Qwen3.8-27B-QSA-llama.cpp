@@ -1668,8 +1668,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // user inputs from host memory: queue all copies, then wait once, instead of a blocking copy
+        // (and a sync) per input. This happens before the copies from other backends are queued below,
+        // so waiting here never waits on another device's compute.
+        static const bool batch_input_copies = getenv("GGML_SCHED_SYNC_INPUTS") == nullptr;
+        std::vector<bool> input_done;
+        if (batch_input_copies && split_backend->iface.set_tensor_async) {
+            bool synced = false, queued = false;
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                struct ggml_tensor * input = split->inputs[input_id];
+                if (!(input->flags & GGML_TENSOR_FLAG_INPUT) || !input->buffer || !ggml_backend_buffer_is_host(input->buffer)) {
+                    continue;
+                }
+                if (!synced) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    synced = true;
+                }
+                ggml_backend_tensor_set_async(split_backend, tensor_copy(input, split_backend_id, sched->cur_copy), input->data, 0, ggml_nbytes(input));
+                input_done.resize(split->n_inputs, false);
+                input_done[input_id] = true;
+                queued = true;
+            }
+            if (queued) {
+                ggml_backend_synchronize(split_backend);
+            }
+        }
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (!input_done.empty() && input_done[input_id]) {
+                continue;
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);

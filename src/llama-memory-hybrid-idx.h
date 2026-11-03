@@ -61,6 +61,8 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+    llama_pos seq_pos_min(llama_seq_id seq_id) const override;
+    llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
@@ -74,6 +76,18 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+
+    // Pooled indexer keys, one F32 row per block of `ratio` cells (row n_blocks is a
+    // scratch row), kept up to date incrementally while blk_valid holds. blk_valid means a
+    // single sequence written in order, every cell holding the token of the same rank (for
+    // text that is the position of the same number), so a block's members are ratio
+    // consecutive cells and a finished block's pooled key never changes. Anything that breaks
+    // that (copies, shifts, restores, other placements) clears it until the cache is emptied
+    // again.
+    llama_kv_cache * get_mem_blk() const;   // nullptr when the model carries no indexer
+    uint32_t get_blk_ratio() const { return blk_ratio; }
+    bool     get_blk_valid() const { return blk_valid; }
+    void     set_blk_valid(bool v) const { blk_valid = v; }
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
@@ -95,8 +109,14 @@ private:
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
+    llama_hparams hparams_blk;
+    bool has_recurrent = false;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    uint32_t blk_ratio = 0;
+    mutable bool blk_valid = true;
+    std::unique_ptr<llama_kv_cache> mem_blk;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -137,6 +157,10 @@ public:
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+
+    // the pooled block-key cache and whether the current ubatch may use / must update it
+    llama_kv_cache * get_blk() const;
+    bool blk_ok() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
