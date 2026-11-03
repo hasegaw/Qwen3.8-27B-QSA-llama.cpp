@@ -40,8 +40,8 @@ QWEN38_MODEL=models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf QWEN38_MMPROJ=models/mm
   deploy/qwen38-v100/run-server.sh          # OpenAI-compatible API on 127.0.0.1:18080/v1
 ```
 
-[deploy/qwen38-v100/README.md](../deploy/qwen38-v100/README.md) covers the launcher options, the Vast.ai supervisor
-files, every setting and switch, memory and VRAM headroom, the benchmarks and checks, and how to move to a newer upstream.
+[deploy/qwen38-v100/README.md](../deploy/qwen38-v100/README.md) covers the launcher options, every setting and switch, memory and VRAM headroom, the benchmarks and checks, and how to
+move to a newer upstream.
 
 ## Credits
 

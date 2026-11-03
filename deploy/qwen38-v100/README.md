@@ -60,17 +60,41 @@ deploy/qwen38-v100/run-server.sh            # OpenAI-compatible API on 127.0.0.1
 | `QWEN38_MODEL` | required | the model GGUF |
 | `QWEN38_MMPROJ` | empty | vision projector. When set, it is loaded once onto CUDA0 and stays there |
 | `QWEN38_HOST`, `QWEN38_PORT` | `127.0.0.1`, `18080` | listen address |
-| `QWEN38_CTX` | `196608` | context size |
+| `QWEN38_CTX` | `196608` | context size. For 262144 with vision, see below |
+| `QWEN38_IMAGE_MAX_TOKENS` | empty | cap on tokens per image. Larger images are downscaled |
 | `QWEN38_CACHE_DIR` | `~/.cache/qwen38` | prompt-cache spill directory (`pc-disk/`). Give it a directory of its own |
 | `QWEN38_NUMA_NODE` | `0` | `numactl --cpunodebind` node, normally the one next to CUDA0. Set it empty to disable |
 | `LLAMA_SERVER` | `build/bin/llama-server` | binary |
 
 Any arguments after the script name are passed through to llama-server.
 
-On a Vast.ai base image, `vast/` holds the supervisor files. Copy `vast/qwen38.sh` to `/opt/supervisor-scripts/qwen38.sh`
-and `vast/qwen38.conf` to `/etc/supervisor/conf.d/qwen38.conf`, then run
-`supervisorctl reread && supervisorctl update`. `stopasgroup` and `killasgroup` matter: without them a restart leaves the old
-llama-server holding the port.
+### 262K context with vision
+
+At 262144 tokens, the attention KV and the indexer buffers grow by about 0.5 GB on CUDA0 and 0.66 GB on CUDA1. With the
+F16 projector resident, a 4K image then fails to get its 478 MiB vision compute buffer on CUDA0. An image whose shape
+needs a new CUDA graph can also crash the server with out of memory in `cudaGraphInstantiate`. Two changes make room:
+
+- **A Q8_0 projector.** `tools/mmproj_q8.py mmproj-F16.gguf mmproj-Q8_0.gguf` converts the 83 F16 matrices whose rows
+  are a multiple of 32 to Q8_0. The 4304-wide FFN-down matrices stay F16. Result: 904 -> 613 MB.
+- **`QWEN38_IMAGE_MAX_TOKENS=2048`.** A 1920x1080 image (2078 tokens) is barely changed. Larger images are downscaled
+  to about 2K tokens, so the vision compute buffer stays bounded.
+
+```sh
+QWEN38_CTX=262144 QWEN38_MMPROJ=models/mmproj-Q8_0.gguf QWEN38_IMAGE_MAX_TOKENS=2048 \
+QWEN38_MODEL=models/Qwen3.8-Flash-Next-IQ3E-Q8D-MTP.gguf deploy/qwen38-v100/run-server.sh
+```
+
+What was measured with these settings:
+
+| Check | Result |
+|---|---|
+| Images: 640x360, 1920x1080, 4K, 8K | all answered correctly |
+| 248,184-token prompt | prefill 2,466 tok/s (101 s); planted fact found; decode 126 tok/s at that depth |
+| 8K image after the long prompt | answered correctly |
+| Peak VRAM | CUDA0 32.26 GB, CUDA1 31.51 GB, of 32.77 GB |
+| Mixed decode benchmark | 22.73 ms per step (115.8 tok/s), the same as at 192K |
+
+Without vision, 262144 needs neither change.
 
 ## Measured
 
