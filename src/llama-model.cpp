@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream> // [mtp-draft-vocab]
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1445,6 +1446,117 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// [mtp-draft-vocab] env LLAMA_MTP_DRAFT_VOCAB=<file>: copy the rows of the QWEN4EXP MTP LM head for the listed token ids into a
+// smaller tensor (see patch-mt-draftvocab.py). Any problem = warning and the members stay null (the original graph).
+static void mtp_draft_vocab_init(llama_model & model,
+        std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs, llama_split_mode split_mode) {
+    const char * env = getenv("LLAMA_MTP_DRAFT_VOCAB");
+    if (!env || !*env || model.arch != LLM_ARCH_QWEN4EXP) {
+        return;
+    }
+    if (split_mode != LLAMA_SPLIT_MODE_LAYER && split_mode != LLAMA_SPLIT_MODE_NONE) {
+        LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " LLAMA_MTP_DRAFT_VOCAB ignored: split mode is not LAYER or NONE\n", __func__);
+        return;
+    }
+    if (model.hparams.n_layer_nextn != 1) {
+        LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " LLAMA_MTP_DRAFT_VOCAB ignored: no single MTP layer\n", __func__);
+        return;
+    }
+    const auto & layer = model.layers[model.hparams.n_layer()]; // as llama_model_qwen4exp::graph_mtp
+    const ggml_tensor * src = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    if (!src || !src->buffer || !ggml_is_contiguous(src)) {
+        LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " LLAMA_MTP_DRAFT_VOCAB ignored: head tensor missing, without buffer or not contiguous\n", __func__);
+        return;
+    }
+    const int64_t n_vocab = (int64_t) model.vocab.n_tokens();
+    if (src->ne[1] != n_vocab) {
+        LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " LLAMA_MTP_DRAFT_VOCAB ignored: head has %lld rows, vocab %lld\n", __func__,
+                (long long) src->ne[1], (long long) n_vocab);
+        return;
+    }
+
+    std::vector<int64_t> ids;
+    {
+        std::ifstream f(env);
+        if (!f) {
+            LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " cannot read %s\n", __func__, env);
+            return;
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line[0] == '#') {
+                continue;
+            }
+            std::istringstream ss(line);
+            std::string tok;
+            while (ss >> tok) {
+                char * end = nullptr;
+                const long long v = strtoll(tok.c_str(), &end, 10);
+                if (end == tok.c_str() || *end != '\0' || v < 0 || v >= n_vocab) {
+                    LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " bad token id '%s' in %s (n_vocab %lld), ignored\n", __func__, tok.c_str(), env, (long long) n_vocab);
+                    return;
+                }
+                ids.push_back(v);
+            }
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (ids.empty() || (int64_t) ids.size() >= n_vocab) {
+        LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " %zu ids in %s (need 1..n_vocab-1), ignored\n", __func__, ids.size(), env);
+        return;
+    }
+    const int64_t n_sub = (int64_t) ids.size();
+
+    ggml_init_params ip = { /*.mem_size =*/ 2*ggml_tensor_overhead() + 1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context_ptr ctx_ptr { ggml_init(ip) };
+    if (!ctx_ptr) {
+        LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " ggml_init failed\n", __func__);
+        return;
+    }
+    ggml_tensor * head = ggml_new_tensor_2d(ctx_ptr.get(), src->type, src->ne[0], n_sub);
+    ggml_tensor * d2t  = ggml_new_tensor_1d(ctx_ptr.get(), GGML_TYPE_I64, n_sub);
+    ggml_set_name(head, "mtp_dv_head.weight");
+    ggml_set_name(d2t,  "mtp_dv_d2t");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx_ptr.get(), buft) };
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: " "[mtp-draft-vocab]" " allocation on %s failed, ignored\n", __func__, ggml_backend_buft_name(buft));
+        return;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const size_t nb1 = src->nb[1];
+    {
+        std::vector<uint8_t> staging((size_t) n_sub * nb1);
+        size_t pos = 0;
+        for (size_t i = 0; i < ids.size(); ) {
+            size_t j = i + 1;
+            while (j < ids.size() && ids[j] == ids[j - 1] + 1) {
+                j++;
+            }
+            ggml_backend_tensor_get(src, staging.data() + pos*nb1, (size_t) ids[i]*nb1, (j - i)*nb1);
+            pos += j - i;
+            i = j;
+        }
+        ggml_backend_tensor_set(head, staging.data(), 0, (size_t) n_sub*nb1);
+    }
+    ggml_backend_tensor_set(d2t, ids.data(), 0, (size_t) n_sub*sizeof(int64_t));
+
+    LLAMA_LOG_INFO("%s: " "[mtp-draft-vocab]" " %lld of %lld rows of %s (%s) copied, %.1f MiB, buffer type %s\n", __func__,
+            (long long) n_sub, (long long) n_vocab, ggml_get_name(src), ggml_type_name(src->type),
+            (double) n_sub*nb1/1024.0/1024.0, ggml_backend_buft_name(buft));
+
+    model.mtp_dv_head = head;
+    model.mtp_dv_d2t  = d2t;
+    model.mtp_dv_src  = src;
+
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1732,7 +1844,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+
     ml.done_getting_tensors();
+
+    if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
+        LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
+
+        can_prefetch.insert(per_layer_tok_embd);
+    }
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -1894,6 +2013,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    mtp_draft_vocab_init(*this, pimpl->ctxs_bufs, split_mode); // [mtp-draft-vocab]
 
     return true;
 }

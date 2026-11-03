@@ -96,6 +96,8 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  --qwen4exp-mtp           Run the Qwen4Exp MTP regression test on CPU\n");
     LOG("  --qwen4exp-mtp-cuda      Run the Qwen4Exp MTP regression test on CUDA\n");
+    LOG("  --qwen4exp-blk-rebuild   Run the Qwen4Exp restored-state pooled-key rebuild test (LLAMA_QSA_BLK_REBUILD=1) on CPU\n");
+    LOG("  --qwen4exp-blk-rebuild-cuda  Same on CUDA, where the pooled-key selection reads the rebuilt keys\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
@@ -116,7 +118,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false, const uint32_t indexer_top_k = 131072) { // [blk-rebuild]
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -337,7 +339,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     // note: using a realistic top-k here makes the results unstable and hard to match between CPU and GPU
     //       a large value makes things deterministic since all data is selected by the indexer
     //ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(131072));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        indexer_top_k); // [blk-rebuild] default 131072
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
@@ -597,6 +599,259 @@ static int test_qwen4exp_mtp(size_t seed, bool cuda = false) {
     }
     llama_batch_free(tb);
     printf("Qwen4Exp target batched verification and rollback: max logit error %.9g\n", max_error);
+    return 0;
+}
+
+// [blk-rebuild2] setenv that also works on Windows
+static void test_setenv(const char * key, const char * value) {
+#ifdef _WIN32
+    _putenv_s(key, value);
+#else
+    setenv(key, value, 1);
+#endif
+}
+
+// [blk-rebuild] [blk-rebuild2] a restored sequence must leave the pooled indexer keys as incremental decoding would, with a negative control.
+//   A : decode prompt P, save seq 0, then 32 greedy tokens (recorded).
+//   B1: clear, decode another prompt Q (overwrites the pooled keys), restore, decode A's 32 tokens with LLAMA_QSA_BLK_REBUILD=1: the
+//       pooled keys are rebuilt, so the logits must equal A's bit for bit.
+//   B2: the same with LLAMA_QSA_BLK_REBUILD=2 (TEST ONLY: layout marked valid, stale keys kept): the logits must differ from A's.
+//       Without B2 a bit-identical B1 proves nothing if the pooled keys are never read.
+// The log counts must match the mode. Both checks of each case are collected and printed before pass or fail is decided.
+// On CUDA indexer_top_k is small (16 -> 4 blocks), so once a query has more than 4 complete blocks the selection reads the pooled keys, and
+// nodes named indexer_top_blk-* (built only by build_qsa_blk_select, the pooled-key fast path; the dense path names its selection
+// indexer_top_k) are counted with cb_eval: > 0 is required in B1 and B2.
+// On CPU the pooled-key fast path is switched off (LLAMA_QSA_DENSE=1: the F16-typed GET_ROWS it builds is a CUDA-only op), so the keys are
+// written but never read: the CPU run checks that the rebuild graph runs and is logged, not the key values, and B2 is skipped.
+static int test_qwen4exp_blk_rebuild(size_t seed, bool cuda) {
+    // LLAMA_QSA_DENSE is read once into a static, so it has to be set before the first decode.
+    // LLAMA_QSA_BLK_REBUILD is read on every restore and is set per case below.
+    if (!cuda) {
+        test_setenv("LLAMA_QSA_DENSE", "1");
+    }
+
+    struct log_state_t {
+        ggml_log_callback old_cb = nullptr;
+        void *            old_ud = nullptr;
+        int n_ok    = 0;   // "restored layout ok"
+        int n_bad   = 0;   // "restored layout not rebuildable"
+        int n_stale = 0;   // "TEST ONLY: restored layout ok, stale pooled keys kept"
+        int n_reb   = 0;   // "pooled keys rebuilt"
+        int n_fb    = 0;   // "rebuild failed, falling back to dense"
+        ~log_state_t() { llama_log_set(old_cb, old_ud); }
+    } ls;
+    llama_log_get(&ls.old_cb, &ls.old_ud);
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        auto * s = (log_state_t *) user_data;
+        s->n_ok    += strstr(text, "qsa-blk: restored layout ok") != nullptr;
+        s->n_bad   += strstr(text, "qsa-blk: restored layout not rebuildable") != nullptr;
+        s->n_stale += strstr(text, "qsa-blk: TEST ONLY: restored layout ok, stale pooled keys kept") != nullptr;
+        s->n_reb   += strstr(text, "qsa-blk: pooled keys rebuilt") != nullptr;
+        s->n_fb    += strstr(text, "qsa-blk: rebuild failed, falling back to dense") != nullptr;
+        if (s->old_cb) {
+            s->old_cb(level, text, s->old_ud);
+        }
+    }, &ls);
+
+    auto gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, false, cuda ? 16 : 131072);
+    auto mp = llama_model_default_params();
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    mp.devices = cpu_only;
+    ggml_backend_dev_t cuda_only[] = { nullptr, nullptr };
+    if (cuda) {
+        ggml_backend_load_all();
+        auto reg = ggml_backend_reg_by_name("CUDA");
+        if (!reg || ggml_backend_reg_dev_count(reg) == 0) { throw std::runtime_error("CUDA regression requires a CUDA device"); }
+        cuda_only[0] = ggml_backend_reg_dev_get(reg, 0);
+        mp.devices = cuda_only;
+    }
+    mp.load_mtp = false;
+    mp.n_gpu_layers = cuda ? 99 : 0;
+    mp.progress_callback = silent_model_load_progress;
+    tensor_data_params tensor_params = { seed, 1e-2f };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, mp));
+    if (!model) {
+        throw std::runtime_error("failed to create blk-rebuild fixture");
+    }
+
+    // executed nodes of the pooled-key fast path; asking is enough (it is called once per node per compute) and answering false keeps
+    // the graph computed as it would be without the callback
+    int fast_nodes = 0;
+
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 256;
+    cp.n_batch = cp.n_ubatch = 16;
+    cp.n_threads = cp.n_threads_batch = 4;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;   // the pooled-key fast path needs flash attention
+    cp.cb_eval = [](ggml_tensor * t, bool ask, void * user_data) -> bool {
+        static const char prefix[] = "indexer_top_blk";
+        if (ask && strncmp(t->name, prefix, sizeof(prefix) - 1) == 0) {
+            ++*(int *) user_data;
+        }
+        return false;
+    };
+    cp.cb_eval_user_data = &fast_nodes;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    if (!ctx) {
+        throw std::runtime_error("failed to create blk-rebuild context");
+    }
+
+    const int n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const int n_prompt = 40;
+    const int n_gen    = 32;
+    const auto P = get_tokens(n_prompt, n_vocab, seed);
+    const auto Q = get_tokens(n_prompt, n_vocab, seed + 1);
+
+    llama_batch batch = llama_batch_init(cp.n_batch, 0, 1);
+    struct batch_guard_t {
+        llama_batch & b;
+        explicit batch_guard_t(llama_batch & b) : b(b) {}
+        ~batch_guard_t() { llama_batch_free(b); }
+    } batch_guard(batch);
+
+    // tokens at positions pos0.. in n_batch chunks, logits for the last token of each chunk; returns the last row
+    const auto decode = [&](const std::vector<llama_token> & tokens, int pos0) {
+        for (size_t s = 0; s < tokens.size(); s += cp.n_batch) {
+            const size_t e = std::min(tokens.size(), s + (size_t) cp.n_batch);
+            batch.n_tokens = 0;
+            for (size_t i = s; i < e; ++i) {
+                common_batch_add(batch, tokens[i], pos0 + (llama_pos) i, {0}, i + 1 == e);
+            }
+            if (llama_decode(ctx.get(), batch) != 0) {
+                throw std::runtime_error("failed to decode blk-rebuild fixture");
+            }
+        }
+        const float * row = llama_get_logits_ith(ctx.get(), -1);
+        if (!row) {
+            throw std::runtime_error("blk-rebuild fixture produced no logits");
+        }
+        return std::vector<float>(row, row + n_vocab);
+    };
+
+    const auto argmax = [&](const std::vector<float> & l) {
+        int best = 0;
+        for (int i = 1; i < n_vocab; ++i) {
+            if (l[i] > l[best]) {
+                best = i;
+            }
+        }
+        return (llama_token) best;
+    };
+
+    auto * memory = llama_get_memory(ctx.get());
+
+    // case A: P, save the state, then n_gen greedy tokens
+    llama_memory_clear(memory, true);
+    llama_token next = argmax(decode(P, 0));
+
+    std::vector<uint8_t> saved(llama_state_seq_get_size(ctx.get(), 0));
+    GGML_ASSERT(llama_state_seq_get_data(ctx.get(), saved.data(), saved.size(), 0) == saved.size());
+
+    std::vector<llama_token>        gen(n_gen);
+    std::vector<std::vector<float>> logits_a(n_gen);
+    fast_nodes = 0;
+    for (int k = 0; k < n_gen; ++k) {
+        gen[k]      = next;
+        logits_a[k] = decode({ next }, n_prompt + k);
+        for (float v : logits_a[k]) {
+            if (!std::isfinite(v)) {
+                throw std::runtime_error("blk-rebuild case A produced a non-finite logit");
+            }
+        }
+        next = argmax(logits_a[k]);
+    }
+    const int fast_nodes_a = fast_nodes;
+
+    // case B in the given LLAMA_QSA_BLK_REBUILD mode: pollute the pooled keys with Q, restore the state saved after P, feed A's tokens
+    struct b_result_t {
+        int   n_ok = 0, n_bad = 0, n_stale = 0, n_reb = 0, n_fb = 0;   // log counts since the restore
+        int   n_fast = 0;                                              // indexer_top_blk nodes executed since the restore
+        int   first_bad = -1;                                          // first step whose logits differ from A's
+        float max_diff  = 0.0f;                                        // largest absolute logit difference over all steps
+    };
+    const auto run_b = [&](const char * mode) {
+        test_setenv("LLAMA_QSA_BLK_REBUILD", mode);
+
+        llama_memory_clear(memory, true);
+        decode(Q, 0);
+
+        ls.n_ok = ls.n_bad = ls.n_stale = ls.n_reb = ls.n_fb = 0;
+        fast_nodes = 0;
+        if (llama_state_seq_set_data(ctx.get(), saved.data(), saved.size(), 0) == 0) {
+            throw std::runtime_error("failed to restore the saved sequence");
+        }
+        if (llama_memory_seq_pos_max(memory, 0) != n_prompt - 1) {
+            throw std::runtime_error("the restored sequence does not end at the prompt's last position");
+        }
+
+        b_result_t r;
+        for (int k = 0; k < n_gen; ++k) {
+            const auto logits_b = decode({ gen[k] }, n_prompt + k);
+            if (memcmp(logits_a[k].data(), logits_b.data(), n_vocab*sizeof(float)) != 0) {
+                if (r.first_bad < 0) {
+                    r.first_bad = k;
+                }
+                for (int i = 0; i < n_vocab; ++i) {
+                    r.max_diff = std::max(r.max_diff, std::abs(logits_a[k][i] - logits_b[i]));
+                }
+            }
+        }
+        r.n_ok = ls.n_ok; r.n_bad = ls.n_bad; r.n_stale = ls.n_stale; r.n_reb = ls.n_reb; r.n_fb = ls.n_fb;
+        r.n_fast = fast_nodes;
+        return r;
+    };
+
+    const auto describe = [](const b_result_t & r) {
+        char buf[320];
+        snprintf(buf, sizeof(buf), "logits %s (first differing step %d, max abs diff %g); log: restored-ok %d, stale-kept %d, "
+                "not-rebuildable %d, rebuilt %d, fallback %d; fast-path nodes %d",
+                r.first_bad < 0 ? "identical to A" : "differ from A", r.first_bad, (double) r.max_diff,
+                r.n_ok, r.n_stale, r.n_bad, r.n_reb, r.n_fb, r.n_fast);
+        return std::string(buf);
+    };
+
+    std::string failures;
+
+    const b_result_t r1 = run_b("1");
+    printf("blk-rebuild B1 (LLAMA_QSA_BLK_REBUILD=1, rebuild): %s\n", describe(r1).c_str());
+
+    bool have_r2 = false;
+    b_result_t r2;
+    if (cuda) {
+        r2 = run_b("2");
+        have_r2 = true;
+        printf("blk-rebuild B2 (LLAMA_QSA_BLK_REBUILD=2, TEST ONLY stale keys kept): %s\n", describe(r2).c_str());
+    } else {
+        printf("blk-rebuild B2 (LLAMA_QSA_BLK_REBUILD=2): skipped on CPU (the fast path is off with LLAMA_QSA_DENSE=1, so stale keys are never read)\n");
+    }
+    printf("blk-rebuild A: fast-path nodes %d%s\n", fast_nodes_a, cuda ? "" : " (not required on CPU)");
+
+    // verdict, only after everything above was gathered and printed
+    if (r1.first_bad >= 0) {
+        failures += "\n  B1: logits after the rebuild differ from the uninterrupted run";
+    }
+    if (!(r1.n_ok == 1 && r1.n_bad == 0 && r1.n_stale == 0 && r1.n_reb == 1 && r1.n_fb == 0)) {
+        failures += "\n  B1: log counts do not match mode 1 (want restored-ok 1, stale-kept 0, not-rebuildable 0, rebuilt 1, fallback 0)";
+    }
+    if (cuda && r1.n_fast <= 0) {
+        failures += "\n  B1: no indexer_top_blk node ran, the pooled-key fast path was not exercised";
+    }
+    if (have_r2) {
+        if (r2.first_bad < 0) {
+            failures += "\n  B2: logits equal A's although stale pooled keys were kept, so the test cannot tell a rebuilt cache from a stale one";
+        }
+        if (!(r2.n_ok == 0 && r2.n_bad == 0 && r2.n_stale == 1 && r2.n_reb == 0 && r2.n_fb == 0)) {
+            failures += "\n  B2: log counts do not match mode 2 (want restored-ok 0, stale-kept 1, not-rebuildable 0, rebuilt 0, fallback 0)";
+        }
+        if (r2.n_fast <= 0) {
+            failures += "\n  B2: no indexer_top_blk node ran, the pooled-key fast path was not exercised";
+        }
+    }
+    if (!failures.empty()) {
+        throw std::runtime_error("blk-rebuild test failed:" + failures);
+    }
+
+    printf("Qwen4Exp pooled-key rebuild after restore (%s): passed\n", cuda ? "CUDA" : "CPU");
     return 0;
 }
 
@@ -1057,6 +1312,8 @@ int main(int argc, char ** argv) {
     std::string out;
     bool qwen4exp_mtp = false;
     bool qwen4exp_mtp_cuda = false;
+    bool qwen4exp_blk_rebuild = false;        // [blk-rebuild]
+    bool qwen4exp_blk_rebuild_cuda = false;   // [blk-rebuild]
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1065,6 +1322,10 @@ int main(int argc, char ** argv) {
             qwen4exp_mtp = qwen4exp_mtp_cuda = true;
         } else if (strcmp(argv[i], "--qwen4exp-mtp") == 0) {
             qwen4exp_mtp = true;
+        } else if (strcmp(argv[i], "--qwen4exp-blk-rebuild-cuda") == 0) {   // [blk-rebuild]
+            qwen4exp_blk_rebuild = qwen4exp_blk_rebuild_cuda = true;
+        } else if (strcmp(argv[i], "--qwen4exp-blk-rebuild") == 0) {        // [blk-rebuild]
+            qwen4exp_blk_rebuild = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
@@ -1130,6 +1391,9 @@ int main(int argc, char ** argv) {
     try {
         if (qwen4exp_mtp) {
             return test_qwen4exp_mtp(seed, qwen4exp_mtp_cuda);
+        }
+        if (qwen4exp_blk_rebuild) {   // [blk-rebuild]
+            return test_qwen4exp_blk_rebuild(seed, qwen4exp_blk_rebuild_cuda);
         }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);

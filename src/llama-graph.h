@@ -97,6 +97,10 @@ struct llm_graph_params;
 // LLAMA_GPU_ARGMAX=1: see llm_graph_context::build_argmax
 bool llama_gpu_argmax_enabled();
 
+// [gpu-topk] LLAMA_GPU_TOPK=K (1..256, needs LLAMA_GPU_ARGMAX=1; unset / 0 = off): K of the device top-K that build_argmax adds to a
+// context's graphs (0 for an MTP draft context when LLAMA_GPU_TOPK_MTP=0)
+int32_t llama_gpu_topk_k(bool mtp_ctx);
+
 //
 // llm_graph_input
 //
@@ -887,6 +891,7 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.mtp_kv_only             == other.cparams.mtp_kv_only             && // [mtp-kvonly]
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -911,6 +916,8 @@ public:
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_argmax()      const { return t_argmax; }
+    ggml_tensor * get_topk_ids()    const { return t_topk_ids; }  // [gpu-topk]
+    ggml_tensor * get_topk_vals()   const { return t_topk_vals; } // [gpu-topk]
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
@@ -947,6 +954,8 @@ public:
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_argmax      = nullptr; // greedy token per output row, computed on the device (LLAMA_GPU_ARGMAX)
+    ggml_tensor * t_topk_ids    = nullptr; // [gpu-topk] [K, n_outputs] I32: the K largest logits of every output row (unordered)
+    ggml_tensor * t_topk_vals   = nullptr; // [gpu-topk] [1, K, n_outputs] F32: their logits
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1363,6 +1372,14 @@ struct llm_graph_context {
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
     llm_graph_input_rs * build_rs_inp() const;
+
+    // A7 P2: only the clearing of the state row (rs_zero) that build_rs does, without the gather and the extra copy;
+    // requires n_rs == n_seqs (no extra states). The node is expanded into the graph.
+    void build_rs_zero(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,

@@ -177,6 +177,83 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+// [topk-det] deterministic gather (GGML_CUDA_TOPK_DET=1): columns in ascending order, ties at the k-th key by lowest index
+template<int NT>
+static __device__ __forceinline__ int2 top_k_det_scan2(int a, int b, int2 & total) {
+    __shared__ int2 warp_sums[NT/32];
+    const int lane = threadIdx.x % 32;
+    const int w    = threadIdx.x / 32;
+    int sa = a, sb = b;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int ta = __shfl_up_sync(0xffffffff, sa, o);
+        const int tb = __shfl_up_sync(0xffffffff, sb, o);
+        if (lane >= o) {
+            sa += ta;
+            sb += tb;
+        }
+    }
+    if (lane == 31) {
+        warp_sums[w] = make_int2(sa, sb);
+    }
+    __syncthreads();
+    if (w == 0) {
+        int va = lane < NT/32 ? warp_sums[lane].x : 0;
+        int vb = lane < NT/32 ? warp_sums[lane].y : 0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int ta = __shfl_up_sync(0xffffffff, va, o);
+            const int tb = __shfl_up_sync(0xffffffff, vb, o);
+            if (lane >= o) {
+                va += ta;
+                vb += tb;
+            }
+        }
+        if (lane < NT/32) {
+            warp_sums[lane] = make_int2(va, vb);
+        }
+    }
+    __syncthreads();
+    const int2 pre = w > 0 ? warp_sums[w - 1] : make_int2(0, 0);
+    total = warp_sums[NT/32 - 1];
+    __syncthreads(); // warp_sums is reused by the next call
+    return make_int2(pre.x + sa - a, pre.y + sb - b);
+}
+
+template<int NT>
+static __global__ void top_k_radix_gather_det(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        const top_k_radix_state * __restrict__ states,
+        int ncols,
+        int k) {
+    const int row = blockIdx.x;
+    const float * row_src = src + (size_t) row * ncols;
+    int * row_dst = dst + (size_t) row * k;
+    const uint32_t prefix = states[row].prefix;
+    const int      rank   = states[row].rank;
+    const int      n_gt   = k - rank;
+
+    int gbase = 0;
+    int ebase = 0;
+    for (int t0 = 0; t0 < ncols && (gbase < n_gt || ebase < rank); t0 += NT) {
+        const int  col = t0 + threadIdx.x;
+        const bool in  = col < ncols;
+        const uint32_t key = in ? top_k_float_to_ordered(row_src[col]) : 0u;
+        const int g = in && key > prefix;
+        const int e = in && key == prefix;
+        int2 total;
+        const int2 off = top_k_det_scan2<NT>(g, e, total);
+        if (g) {
+            row_dst[gbase + off.x] = col;
+        } else if (e && ebase + off.y < rank) {
+            row_dst[n_gt + ebase + off.y] = col;
+        }
+        gbase += total.x;
+        ebase += total.y;
+    }
+}
+
 // One launch per radix digit: every block histograms its slice of the row, and the last block of
 // the row to finish sums the slices and picks the digit (what top_k_radix_select does), so the select
 // needs no launch of its own. The first pass starts from the initial state and the last pass clears
@@ -296,6 +373,11 @@ static void top_k_radix_cuda(
                 <<<row_grid, BLOCK_SIZE, 0, stream>>>(
                     src, states, histograms, counters, ncols, blocks_per_row, shift, k,
                     shift == 32 - RADIX_BITS, shift == 0);
+        }
+        static const bool det = [] { const char * e = getenv("GGML_CUDA_TOPK_DET"); return e && atoi(e) != 0; }(); // [topk-det]
+        if (det) {
+            top_k_radix_gather_det<1024><<<nrows, 1024, 0, stream>>>(src, dst, states, ncols, k);
+            return;
         }
         top_k_radix_gather<BLOCK_SIZE>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(

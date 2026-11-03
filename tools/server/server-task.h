@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <array>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -598,6 +599,13 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // [pc-disk] spilled entry: the bytes of data and of the checkpoints live in disk_path (tokens stay in memory)
+    std::string disk_path;
+    size_t disk_size = 0;
+    size_t disk_main = 0;
+    size_t disk_drft = 0;
+    std::vector<std::array<size_t, 3>> disk_ckpt; // per checkpoint: data_tgt, data_dft, data_spec sizes
+
     size_t size() const {
         size_t res = data.size();
 
@@ -613,9 +621,25 @@ struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        disk_init();
     }
 
+    ~server_prompt_cache();
+
     std::list<server_prompt_cache_state> states;
+
+    // [pc-disk] second tier on disk (LLAMA_PROMPT_CACHE_DISK), oldest first
+    std::list<server_prompt_cache_state> disk_states;
+    std::string disk_dir;     // empty = disk tier off
+    size_t disk_limit   = 0; // bytes
+    size_t disk_reserve = 0; // bytes that must stay free on the filesystem
+    size_t disk_seq     = 0;
+
+    void   disk_init();
+    size_t disk_size() const;
+    bool   disk_spill(server_prompt_cache_state & state);
+    void   disk_remove(server_prompt_cache_state & state);
+    void   evict_front(); // spill (or drop) the oldest RAM entry
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

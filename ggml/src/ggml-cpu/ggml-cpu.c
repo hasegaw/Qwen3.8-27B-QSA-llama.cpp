@@ -2190,6 +2190,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_ALLREDUCE:
         case GGML_OP_ARGMAX_SPLIT:
+        case GGML_OP_A7_GDN_FFN:
+        case GGML_OP_A7_GDN_ATTN:
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2525,6 +2527,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_ALLREDUCE:
         case GGML_OP_ARGMAX_SPLIT:
+        case GGML_OP_A7_GDN_FFN:
+        case GGML_OP_A7_GDN_ATTN:
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -3063,6 +3067,8 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_ALLREDUCE:
                 case GGML_OP_ARGMAX_SPLIT:
+                case GGML_OP_A7_GDN_FFN:
+                case GGML_OP_A7_GDN_ATTN:
         case GGML_OP_COUNT:
                     {
                         GGML_ABORT("fatal error");

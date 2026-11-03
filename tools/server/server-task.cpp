@@ -12,6 +12,16 @@
 
 #include <sstream>
 
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+
 //
 // task_params
 //
@@ -1688,6 +1698,165 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// [pc-disk]
+static bool pcd_write_all(int fd, const uint8_t * p, size_t n) {
+    while (n > 0) {
+        const ssize_t w = ::write(fd, p, std::min<size_t>(n, 64ull << 20));
+        if (w < 0 && errno == EINTR) {
+            continue;
+        }
+        if (w <= 0) {
+            if (w == 0) {
+                errno = EIO;
+            }
+            return false;
+        }
+        p += w;
+        n -= (size_t) w;
+    }
+    return true;
+}
+
+void server_prompt_cache::disk_init() {
+    const char * dir = getenv("LLAMA_PROMPT_CACHE_DISK");
+    if (dir == nullptr || *dir == '\0') {
+        return;
+    }
+    const char * mib = getenv("LLAMA_PROMPT_CACHE_DISK_MIB");
+    const long long lim = mib ? atoll(mib) : 65536;
+    if (lim <= 0) {
+        SRV_WRN("%s", "[pc-disk] LLAMA_PROMPT_CACHE_DISK_MIB <= 0: disk tier off\n");
+        return;
+    }
+    disk_limit = 1024ull*1024ull*(size_t) lim;
+    const char * res = getenv("LLAMA_PROMPT_CACHE_DISK_RESERVE_MIB");
+    disk_reserve = 1024ull*1024ull*(size_t) std::max<long long>(0, res ? atoll(res) : 16384);
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        SRV_WRN("[pc-disk] cannot create %s: %s; disk tier off\n", dir, ec.message().c_str());
+        return;
+    }
+    // the files of a server that is gone are never valid: remove pc-<pid> of dead processes (same PID namespace assumed)
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        std::error_code ec2;
+        if (name.rfind("pc-", 0) != 0 || !it->is_directory(ec2)) {
+            continue;
+        }
+        const long pid = atol(name.c_str() + 3);
+        if (pid > 0 && pid != (long) getpid() && kill((pid_t) pid, 0) != 0 && errno == ESRCH) {
+            fs::remove_all(it->path(), ec2);
+            SRV_WRN("[pc-disk] removed %s of a stopped server\n", it->path().c_str());
+        }
+    }
+    disk_dir = std::string(dir) + "/pc-" + std::to_string((long) getpid());
+    fs::create_directories(disk_dir, ec);
+    if (ec) {
+        SRV_WRN("[pc-disk] cannot create %s: %s; disk tier off\n", disk_dir.c_str(), ec.message().c_str());
+        disk_dir.clear();
+        return;
+    }
+    SRV_WRN("[pc-disk] evicted prompt cache entries spill to %s (limit %.0f MiB)\n", disk_dir.c_str(), disk_limit / (1024.0 * 1024.0));
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    if (!disk_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(disk_dir, ec);
+    }
+}
+
+size_t server_prompt_cache::disk_size() const {
+    size_t res = 0;
+    for (const auto & st : disk_states) {
+        res += st.disk_size;
+    }
+    return res;
+}
+
+void server_prompt_cache::disk_remove(server_prompt_cache_state & st) {
+    if (!st.disk_path.empty()) {
+        ::unlink(st.disk_path.c_str());
+        st.disk_path.clear();
+    }
+}
+
+bool server_prompt_cache::disk_spill(server_prompt_cache_state & st) {
+    const size_t bytes = st.size();
+    if (disk_dir.empty() || bytes < (64ull << 20) || (disk_limit > 0 && bytes > disk_limit)) {
+        return false;
+    }
+    while (!disk_states.empty() && disk_size() + bytes > disk_limit) {
+        SRV_WRN("[pc-disk] disk limit: removing oldest spilled entry (%.1f MiB)\n", disk_states.front().disk_size / (1024.0 * 1024.0));
+        disk_remove(disk_states.front());
+        disk_states.pop_front();
+    }
+    {
+        // the directory may be gone (a previous cache object of this process removed it on destruction): recreate it
+        std::error_code ec;
+        std::filesystem::create_directories(disk_dir, ec);
+        struct statvfs vfs;
+        if (statvfs(disk_dir.c_str(), &vfs) != 0 || (size_t) vfs.f_bavail * vfs.f_frsize < bytes + disk_reserve) {
+            SRV_WRN("[pc-disk] less than %.0f MiB would stay free on %s; entry dropped\n", disk_reserve / (1024.0 * 1024.0), disk_dir.c_str());
+            return false;
+        }
+    }
+    const std::string path = disk_dir + "/" + std::to_string(++disk_seq) + ".bin";
+    const int64_t t0 = ggml_time_us();
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        SRV_WRN("[pc-disk] open %s failed: %s; entry dropped\n", path.c_str(), strerror(errno));
+        return false;
+    }
+    std::vector<std::array<size_t, 3>> ck;
+    bool ok = pcd_write_all(fd, st.data.main.data(), st.data.main.size()) &&
+              pcd_write_all(fd, st.data.drft.data(), st.data.drft.size());
+    for (const auto & cp : st.prompt.checkpoints) {
+        ok = ok && pcd_write_all(fd, cp.data_tgt.data(),  cp.data_tgt.size())
+                && pcd_write_all(fd, cp.data_dft.data(),  cp.data_dft.size())
+                && pcd_write_all(fd, cp.data_spec.data(), cp.data_spec.size());
+        ck.push_back({ cp.data_tgt.size(), cp.data_dft.size(), cp.data_spec.size() });
+    }
+    const int err = ok ? 0 : errno;
+    ok = ok && ::fdatasync(fd) == 0;
+    if (ok) {
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    }
+    ::close(fd);
+    if (!ok) {
+        SRV_WRN("[pc-disk] write %s failed: %s; entry dropped\n", path.c_str(), strerror(err ? err : errno));
+        ::unlink(path.c_str());
+        return false;
+    }
+    st.disk_path = path;
+    st.disk_size = bytes;
+    st.disk_main = st.data.main.size();
+    st.disk_drft = st.data.drft.size();
+    st.disk_ckpt = std::move(ck);
+    std::vector<uint8_t>().swap(st.data.main);
+    std::vector<uint8_t>().swap(st.data.drft);
+    for (auto & cp : st.prompt.checkpoints) {
+        std::vector<uint8_t>().swap(cp.data_tgt);
+        std::vector<uint8_t>().swap(cp.data_dft);
+        std::vector<uint8_t>().swap(cp.data_spec);
+    }
+    SRV_WRN("[pc-disk] spilled %d tokens (%zu checkpoints), %.1f MiB in %.0f ms; on disk: %zu entries, %.1f MiB\n",
+            st.prompt.n_tokens(), st.prompt.checkpoints.size(), bytes / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0,
+            disk_states.size() + 1, (disk_size() + bytes) / (1024.0 * 1024.0));
+    return true;
+}
+
+void server_prompt_cache::evict_front() {
+    if (disk_spill(states.front())) {
+        disk_states.splice(disk_states.end(), states, states.begin());
+    } else {
+        states.pop_front();
+    }
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1715,6 +1884,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            return nullptr;
+        }
+    }
+    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) { // [pc-disk]
+        if ((int) it->prompt.tokens.get_common_prefix(prompt.tokens) == (int) prompt.tokens.size()) {
+            SRV_TRC("%s", " - prompt is already in the disk cache, skipping\n");
             return nullptr;
         }
     }
@@ -1746,6 +1921,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             ++it;
         }
     }
+    for (auto it = disk_states.begin(); it != disk_states.end();) { // [pc-disk]
+        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+
+        if (len == (int) it->prompt.tokens.size()) {
+            disk_remove(*it);
+            it = disk_states.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
@@ -1753,7 +1938,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front(); // [pc-disk]
         }
     }
 
@@ -1822,6 +2007,83 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    // [pc-disk] a spilled entry wins only if it beats the best RAM entry (same rule)
+    auto it_disk = disk_states.end();
+    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            f_keep_best = f_keep_cur;
+            f_sim_best  = f_sim_cur;
+
+            it_disk = it;
+            it_best = states.end();
+        }
+    }
+
+    if (it_disk != disk_states.end()) {
+        const int64_t t0 = ggml_time_us();
+        const size_t total = it_disk->disk_size;
+        const int fd = ::open(it_disk->disk_path.c_str(), O_RDONLY | O_CLOEXEC);
+        struct stat sb;
+        const bool whole = fd >= 0 && fstat(fd, &sb) == 0 && (size_t) sb.st_size == total; // a short file would SIGBUS in mmap
+        if (fd >= 0 && !whole) {
+            errno = EIO;
+        }
+        void * map = whole ? mmap(nullptr, total, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+        if (map == MAP_FAILED) {
+            // nothing restored yet: keep the slot as it is and forget the entry
+            SRV_WRN("[pc-disk] cannot read %s: %s; entry dropped\n", it_disk->disk_path.c_str(), strerror(errno));
+            if (fd >= 0) {
+                ::close(fd);
+            }
+            disk_remove(*it_disk);
+            disk_states.erase(it_disk);
+            return true;
+        }
+        madvise(map, total, MADV_SEQUENTIAL);
+        const uint8_t * base = (const uint8_t *) map;
+        bool ok = llama_state_seq_set_data_ext(ctx_tgt, base, it_disk->disk_main, id_slot, 0) == it_disk->disk_main;
+        if (ok && it_disk->disk_drft > 0) {
+            GGML_ASSERT(ctx_dft);
+            ok = llama_state_seq_set_data_ext(ctx_dft, base + it_disk->disk_main, it_disk->disk_drft, id_slot, 0) == it_disk->disk_drft;
+        }
+        size_t off = it_disk->disk_main + it_disk->disk_drft;
+        size_t i = 0;
+        for (auto & cp : it_disk->prompt.checkpoints) {
+            if (!ok || i >= it_disk->disk_ckpt.size()) {
+                ok = false;
+                break;
+            }
+            const auto & s = it_disk->disk_ckpt[i++];
+            cp.data_tgt.assign(base + off, base + off + s[0]);  off += s[0];
+            cp.data_dft.assign(base + off, base + off + s[1]);  off += s[1];
+            cp.data_spec.assign(base + off, base + off + s[2]); off += s[2];
+        }
+        munmap(map, total);
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        ::close(fd);
+        disk_remove(*it_disk);
+        if (!ok || off != total) {
+            SRV_ERR("[pc-disk] failed to restore %zu bytes from disk\n", total);
+            disk_states.erase(it_disk);
+            return false;
+        }
+        SRV_WRN("[pc-disk] restored %d tokens (%zu checkpoints), %.1f MiB from disk in %.0f ms, f_keep = %.3f, f_sim = %.3f\n",
+                it_disk->prompt.n_tokens(), it_disk->prompt.checkpoints.size(), total / (1024.0 * 1024.0),
+                (ggml_time_us() - t0) / 1000.0, f_keep_best, f_sim_best);
+        prompt = std::move(it_disk->prompt);
+        disk_states.erase(it_disk);
+        return true;
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -1872,7 +2134,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front(); // [pc-disk]
         }
     }
 
@@ -1887,7 +2149,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front(); // [pc-disk]
         }
     }
 

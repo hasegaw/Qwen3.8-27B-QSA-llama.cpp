@@ -17,7 +17,16 @@ static bool qsa_blk_debug() {
     static const bool enabled = [] { const char * e = getenv("LLAMA_QSA_BLK_DEBUG"); return e && atoi(e) != 0; }();
     return enabled;
 }
-#define QSA_BLK_INVALIDATE(why) do { if (blk_valid && qsa_blk_debug()) { LLAMA_LOG_INFO("qsa-blk: layout invalidated by %s\n", why); } blk_valid = false; } while (0)
+// [blk-rebuild] LLAMA_QSA_BLK_REBUILD: after a state restore, rebuild the pooled block keys from the restored raw indexer keys
+// instead of leaving the layout invalid. Off by default.
+// [blk-rebuild2] unset or 0: off. 2: TEST ONLY negative control, the layout is marked valid again but the stale pooled keys are kept.
+// Any other value: rebuild. Read on every call - only state_read asks, which is rare - so a test can switch modes within one process.
+static int qsa_blk_rebuild_mode() {
+    const char * e = getenv("LLAMA_QSA_BLK_REBUILD");
+    return e ? atoi(e) : 0;
+}
+// [blk-rebuild] WARN, not INFO: libllama's INFO is hidden at the server's default verbosity (the line only prints with LLAMA_QSA_BLK_DEBUG=1)
+#define QSA_BLK_INVALIDATE(why) do { if (blk_valid && qsa_blk_debug()) { LLAMA_LOG_WARN("qsa-blk: layout invalidated by %s\n", why); } blk_valid = false; blk_rebuild = false; blk_rebuild_tries = 0; } while (0)
 
 //
 // llama_memory_hybrid_idx
@@ -183,6 +192,8 @@ void llama_memory_hybrid_idx::clear(bool data) {
 
     // an empty cache is trivially laid out by position; blocks are rebuilt as they fill
     blk_valid = true;
+    blk_rebuild = false;   // [blk-rebuild] nothing left to rebuild
+    blk_rebuild_tries = 0; // [blk-rebuild2]
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -202,9 +213,11 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     // when its ubatch is applied. Emptying the cache makes the layout valid again.
     if (res && get_mem_attn()->seq_pos_max(seq_id < 0 ? 0 : seq_id) < 0 && (seq_id <= 0)) {
         if (!blk_valid && qsa_blk_debug()) {
-            LLAMA_LOG_INFO("qsa-blk: layout valid again (cache emptied)\n");
+            LLAMA_LOG_WARN("qsa-blk: layout valid again (cache emptied)\n");   // [blk-rebuild] INFO -> WARN
         }
         blk_valid = true;
+        blk_rebuild = false;   // [blk-rebuild] nothing left to rebuild
+        blk_rebuild_tries = 0; // [blk-rebuild2]
     }
 
     return res;
@@ -321,6 +334,33 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 
         throw;
     }
+
+    // [blk-rebuild] the pooled keys are not part of the saved state, but the raw indexer keys are. If the restored cells are laid out
+    // the way the pooled cache assumes, mark it valid again and have the next ubatch re-pool every block from those keys.
+    // Only reached when the restore went through (the catch above rethrows).
+    // [blk-rebuild2] the mode is read per restore: 2 is the TEST ONLY negative control
+    const int blk_mode = qsa_blk_rebuild_mode();
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && mem_blk && blk_mode != 0) {
+        const char * why = nullptr;
+        const char * who = has_recurrent ? "target" : "draft";
+
+        if (blk_layout_ok(&why)) {
+            blk_valid = true;
+            blk_rebuild_tries = 0;
+
+            if (blk_mode == 2) {
+                // [blk-rebuild2] TEST ONLY: valid again, but blk_rebuild stays false (QSA_BLK_INVALIDATE above cleared it), so the next
+                // ubatches select blocks by the stale pooled keys left in mem_blk. For checking that a test can tell a rebuilt cache from a stale one.
+                LLAMA_LOG_WARN("qsa-blk: TEST ONLY: restored layout ok, stale pooled keys kept (%s)\n", who);
+            } else {
+                blk_rebuild = true;
+
+                LLAMA_LOG_WARN("qsa-blk: restored layout ok (%s), pooled keys will be rebuilt on the next ubatch\n", who);
+            }
+        } else {
+            LLAMA_LOG_WARN("qsa-blk: restored layout not rebuildable: %s (%s)\n", why ? why : "unknown", who);
+        }
+    }
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
@@ -337,6 +377,108 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, -1, -1);
     }
+}
+
+// [blk-rebuild] The layout the incremental pooled cache assumes, checked on the restored cells of both caches (stream 0): cell j holds
+// the token of rank j of seq 0, so block b is cells b*ratio..; cells run in the (pos, y, x) order set_input_qsa ranks them by; the first
+// position is 0. Check 7 is meant to also require a text cell to be one position after the previous one, a jump being allowed only next
+// to a 2-D cell. [blk-rebuild2] It is inert for this model: IMROPE stores ext=(p,p) for text cells (the text position is broadcast to every
+// section in llama-batch.cpp and apply_ubatch() keeps it as ext.x/ext.y), so is_2d() holds for every cell with p > 0 and no jump is ever
+// rejected. What is guaranteed: cells 0..n-1 packed, seq 0 only, strictly increasing (pos, y, x), first position 0. Text positions may
+// still jump (for example a draft context that skipped an image's embeddings).
+bool llama_memory_hybrid_idx::blk_layout_ok(const char ** why) const {
+    // check() returns 0 for ok, else an index into these
+    static const char * const why_attn[] = {
+        nullptr,
+        "attention cache missing",
+        "attention cache has more than one stream",
+        "attention cells are not packed from cell 0",
+        "attention cell belongs to another sequence",
+        "attention cells are not in strictly increasing position order",
+        "attention cache does not start at position 0",
+        "attention cache has a position jump away from an image",
+    };
+    static const char * const why_idx[] = {
+        nullptr,
+        "indexer cache missing",
+        "indexer cache has more than one stream",
+        "indexer cells are not packed from cell 0",
+        "indexer cell belongs to another sequence",
+        "indexer cells are not in strictly increasing position order",
+        "indexer cache does not start at position 0",
+        "indexer cache has a position jump away from an image",
+    };
+
+    const auto check = [](const llama_kv_cache * kv) -> int {
+        if (kv == nullptr) {
+            return 1;
+        }
+
+        if (kv->get_n_stream() != 1) {
+            return 2;
+        }
+
+        const auto & cells = kv->get_cells(0);
+
+        // used count == used_max_p1 == n means the used cells are exactly 0..n-1
+        const uint32_t n = cells.used_max_p1();
+        if (n == 0 || cells.get_used() != n) {
+            return 3;
+        }
+
+        for (uint32_t j = 0; j < n; ++j) {
+            if (cells.seq_count(j) != 1 || !cells.seq_has(j, 0)) {
+                return 4;
+            }
+        }
+
+        if (cells.pos_get(0) != 0) {
+            return 6;
+        }
+
+        const auto is_2d = [&cells](uint32_t j) {
+            const auto & e = cells.ext_get(j);
+
+            return e.x != 0 || e.y != 0;
+        };
+
+        for (uint32_t j = 1; j < n; ++j) {
+            const llama_pos pa = cells.pos_get(j - 1);
+            const llama_pos pb = cells.pos_get(j);
+            const auto &    ea = cells.ext_get(j - 1);
+
+            // same total order as set_input_qsa: pos, then ext.y, then ext.x; strictly increasing along the cells
+            if (pa > pb || (pa == pb && !cells.ext_get(j).is_2d_gt(ea.x, ea.y))) {
+                return 5;
+            }
+
+            // meant: a jump only next to a 2-D cell. [blk-rebuild2] With IMROPE text cells carry ext=(p,p), so this never fires (see above)
+            if (pb != pa + 1 && !is_2d(j - 1) && !is_2d(j)) {
+                return 7;
+            }
+        }
+
+        return 0;
+    };
+
+    const char * dummy = nullptr;
+    if (why == nullptr) {
+        why = &dummy;
+    }
+
+    const llama_kv_cache * const caches[2] = { get_mem_attn(), get_mem_idx() };
+
+    for (int c = 0; c < 2; ++c) {
+        const int code = check(caches[c]);
+
+        if (code != 0) {
+            *why = (c == 0 ? why_attn : why_idx)[code];
+
+            return false;
+        }
+    }
+
+    return true;
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
@@ -726,6 +868,18 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
 
 bool llama_memory_hybrid_idx_context::next() {
+    // [blk-rebuild] next() runs only after the ubatch went through, so a failed one retries the rebuild on the next decode
+    // read the cursor-dependent values before ctx_idx moves on
+    if (blk_rebuild_cur) {
+        const int64_t r  = mem->get_blk_ratio();
+        const int64_t n  = (int64_t) get_attn()->get_ubatch().n_tokens;
+        const int64_t c0 = (int64_t) get_idx()->ubatch_cell0();
+
+        mem->set_blk_rebuild(false);
+
+        LLAMA_LOG_WARN("qsa-blk: pooled keys rebuilt (%d blocks)\n", r > 0 ? (int) ((c0 + n - 1)/r + 1) : 0);
+    }
+
     if (ctx_idx) {
         ctx_idx->next();
     }
@@ -743,13 +897,32 @@ bool llama_memory_hybrid_idx_context::apply() {
         get_attn()->has_ubatch() && !get_attn()->ubatch_cells_follow()) {
         if (qsa_blk_debug()) {
             const auto & ub = get_attn()->get_ubatch();
-            LLAMA_LOG_INFO("qsa-blk: layout invalidated by a misplaced ubatch (n_tokens=%u, pos0=%d)\n", ub.n_tokens, ub.n_tokens ? ub.pos[0] : -1);
+            LLAMA_LOG_WARN("qsa-blk: layout invalidated by a misplaced ubatch (n_tokens=%u, pos0=%d)\n", ub.n_tokens, ub.n_tokens ? ub.pos[0] : -1);   // [blk-rebuild] INFO -> WARN
         }
         mem->set_blk_valid(false);
     }
 
     if (ctx_idx) {
         res = res & ctx_idx->apply();
+    }
+
+    // [blk-rebuild] the cells of this ubatch are in place now, so blk_ok() can say whether the pooled cache is usable for it;
+    // if it is and a rebuild is pending, this ubatch re-pools every block
+    blk_rebuild_cur = mem && mem->get_blk_rebuild() && blk_ok();
+
+    // [blk-rebuild2] apply() runs once per ubatch attempt (llama_context::process_ubatch; the reserve paths build their graphs on init_full()
+    // contexts and never apply, and an update context has no ubatch so blk_ok() is false for it). A pending rebuild that an earlier apply()
+    // already captured and that next() never confirmed means that attempt failed: do not retry the rebuild forever, fall back to the dense
+    // path. set_blk_valid(false) also clears blk_rebuild and the counter.
+    if (blk_rebuild_cur) {
+        if (mem->get_blk_rebuild_tries() > 0) {
+            LLAMA_LOG_WARN("qsa-blk: rebuild failed, falling back to dense (%s)\n", mem->get_blk_who());
+
+            mem->set_blk_valid(false);
+            blk_rebuild_cur = false;
+        } else {
+            mem->set_blk_rebuild_tries(1);
+        }
     }
 
     return res;

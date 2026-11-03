@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "../../src/llama-ext.h" // [pp-plan-hint] llama_set_pp_plan_hint
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -82,6 +83,31 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
+    return result;
+}
+
+// a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
+static std::vector<llama_token> server_accept_replay(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); ++i) {
+        // the token is discarded - the call is what advances the sampler over this position
+        common_sampler_sample(smpl, ctx, idxs[i]);
+        common_sampler_accept(smpl, draft[i], true);
+        result.push_back(draft[i]);
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
     return result;
 }
 
@@ -285,10 +311,18 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    llama_tokens spec_ahead_next; // [draft-ahead] the next draft when the last bonus token was the first ahead token
+    bool la_resume_next = false;  // [la-s0] the next decode resumes the queued lookahead window
+    std::vector<std::vector<llama_token_data>> spec_ahead_next_q; // [la-s0b] draft distributions of spec_ahead_next
+    bool spec_q_keep = false;     // [la-s0b] spec_draft_q belongs to the ahead draft set for the next window
+
+    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_round_rejection = false; // this round drafted for rejection sampling
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -504,6 +538,11 @@ struct server_slot {
         return !!spec;
     }
 
+    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+    bool use_spec_rejection() const {
+        return task && task->params.sampling.temp > 0.0f;
+    }
+
     void add_token(const completion_token_output & token) {
         if (!is_processing()) {
             SLT_WRN(*this, "%s", "slot is not processing\n");
@@ -575,6 +614,13 @@ struct server_slot {
     }
 
     void release() {
+        // [la-cancel] a task that ends here (cancel, error, ...) drops the queued lookahead window first
+        if (la_resume_next || (ctx_tgt != nullptr && llama_lookahead_pending(ctx_tgt))) {
+            if (ctx_tgt != nullptr) {
+                llama_decode_discard(ctx_tgt);
+            }
+            la_resume_next = false;
+        }
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -1737,7 +1783,29 @@ private:
         return output;
     }
 
+    // [la-ctl] lookahead level: LLAMA_LOOKAHEAD, re-read from LLAMA_LOOKAHEAD_FILE at each request start
+    static int & la_level() {
+        static int v = [] { const char * e = getenv("LLAMA_LOOKAHEAD"); return e ? atoi(e) : 0; }();
+        return v;
+    }
+    static void la_level_reload() {
+        static const char * f = getenv("LLAMA_LOOKAHEAD_FILE");
+        if (!f) {
+            return;
+        }
+        FILE * fp = fopen(f, "r");
+        int v = 0;
+        if (fp && fscanf(fp, "%d", &v) == 1 && v != la_level()) {
+            SRV_INF("[la-ctl] lookahead level %d -> %d\n", la_level(), v);
+            la_level() = v;
+        }
+        if (fp) {
+            fclose(fp);
+        }
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        la_level_reload(); // [la-ctl]
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -3047,6 +3115,12 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
+                    // stale candidates: a replay never reads them, a new draft refills them
+                    if (!slot.spec_q_keep) { // [la-s0b] except the distributions of an ahead draft
+                        slot.spec_draft_q.clear();
+                    }
+                    slot.spec_q_keep = false;
+
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
@@ -3066,6 +3140,9 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        const bool spec_reject = slot.use_spec_rejection() && params_base.speculative.draft.probabilistic;
+                        slot.spec_round_rejection = spec_reject;
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3073,6 +3150,9 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .temp     = */ slot.task->params.sampling.temp,
+                            /* .seed     = */ slot.task->params.sampling.seed,
                         };
 
                         drafting.push_back(&slot);
@@ -3106,7 +3186,9 @@ private:
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                // [draft-ahead] a draft kept for its continuation keeps its rows until the continuation ran
+                if (!common_speculative_ahead_pending(spec.get(), slot.id) &&
+                        !llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }
@@ -3609,9 +3691,18 @@ private:
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // [ckpt-tail] LLAMA_CKPT_TAIL_UBATCH=0: no checkpoint 4 + n_ubatch tokens before the end, so the last
+                            // ubatch is not processed alone (an edited last user message restores the checkpoint at its start)
+                            static const bool ckpt_tail_ubatch = [] {
+                                const char * value = std::getenv("LLAMA_CKPT_TAIL_UBATCH");
+                                return value == nullptr || std::atoi(value) != 0;
+                            }();
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (!ckpt_tail_ubatch && offset != 4) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -3623,6 +3714,9 @@ private:
                             }
                         }
                     }
+
+                    // [pp-plan-hint] the prompt tokens left after this batch, so pp plan-ahead reserves for the prompt's end once
+                    llama_set_pp_plan_hint(ctx_tgt, (uint32_t) std::max<int64_t>(0, (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens()));
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
@@ -3727,8 +3821,41 @@ private:
         spec_phase_lap(15, g_spec_mark);
         spec_phase_scope spec_scope_decode(1);
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            // [la-s0] a window whose GPU0 part was queued by the last stage 0: run only the rest
+            bool la_resume = false;
+            for (auto & s : slots) {
+                if (s.la_resume_next) {
+                    la_resume = true;
+                    s.la_resume_next = false;
+                }
+            }
+            ret = la_resume ? llama_decode_resume(ctx_tgt, batch_view) : llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
+                // [draft-ahead] continue the draft on the draft context while the target verifies it
+                if (spec && common_speculative_ahead_pending(spec.get(), 0)) {
+                    common_speculative_draft_ahead(spec.get(), 0);
+
+                    // [la-s0] queue the GPU0 part of the next window [d4..d7] (greedy verify window of one slot, room left)
+                    const bool la_on = la_level() != 0; // [la-ctl]
+                    static llama_batch la_b = llama_batch_init(8, 0, 1);
+                    if (la_on && batch_view.n_tokens == 4) {
+                        for (auto & s : slots) {
+                            if (s.state != SLOT_STATE_GENERATING || s.spec_i_batch.size() != 4 ||
+                                    (s.spec_round_rejection && common_speculative_ahead_dists(spec.get(), s.id).size() != 4)) { // [la-s0b]
+                                continue;
+                            }
+                            const auto & ah = common_speculative_ahead_tokens(spec.get(), s.id);
+                            if (ah.size() == 4 && s.get_n_draft_max() >= 8) {
+                                common_batch_clear(la_b);
+                                for (int k = 0; k < 4; ++k) {
+                                    common_batch_add(la_b, ah[k], batch_view.pos[batch_view.n_tokens - 1] + 1 + k, { s.id }, true);
+                                }
+                                llama_decode_lookahead(ctx_tgt, la_b);
+                            }
+                            break;
+                        }
+                    }
+                }
                 llama_synchronize(ctx_tgt);
             }
         });
@@ -3963,12 +4090,39 @@ private:
                 spec_phase_lap(9, acc_mark);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+
+                // drafters that fill no distribution fall back here
+                const bool use_rejection = slot.spec_round_rejection && !slot.spec_draft_q.empty();
+
+                std::vector<llama_token> accepted;
+                bool la_rej = false; // [la-s0b] d4 was verified as a fourth draft (no bonus)
+                if (!synth_probs.empty()) {
+                    // synthetic acceptance replaces verification entirely, so it comes first
+                    accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (slot.spec_is_replay && slot.spec_round_rejection) {
+                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else if (use_rejection) {
+                    // [la-s0b] with the ahead tokens of this draft: verify [d1..d3, d4] without a bonus token (the n-max 4 rejection test);
+                    // all four accepted = d4 is the next token and the next window verifies d5.. with their draft distributions
+                    const auto & ah  = common_speculative_ahead_tokens(spec.get(), slot.id);
+                    const auto & ahq = common_speculative_ahead_dists(spec.get(), slot.id);
+                    if (ah.size() >= 2 && ahq.size() == ah.size()) {
+                        llama_tokens d_la = slot.spec_draft;
+                        d_la.push_back(ah[0]);
+                        auto q_la = slot.spec_draft_q;
+                        q_la.push_back(ahq[0]);
+                        accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, d_la, q_la, false, false);
+                        la_rej = true;
+                    } else {
+                        accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    }
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
                 spec_phase_lap(10, acc_mark);
 
@@ -4019,6 +4173,40 @@ private:
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
+                // [draft-ahead] every draft accepted and the bonus token is the first ahead token: the rest is the next draft
+                slot.spec_ahead_next.clear();
+                {
+                    const auto & ah = common_speculative_ahead_tokens(spec.get(), slot.id);
+                    static const bool alog = getenv("LLAMA_DRAFT_AHEAD_LOG") != nullptr;
+                    static int64_t n_win = 0, n_avail = 0, n_hit = 0;
+                    const bool hit = (la_rej || !slot.spec_round_rejection) && accepted.size() == n_draft + 1 && ah.size() >= 2 && ah[0] == accepted.back();
+                    slot.spec_ahead_next_q.clear();
+                    if (hit) {
+                        slot.spec_ahead_next.assign(ah.begin() + 1, ah.end());
+                        if (la_rej) { // [la-s0b]
+                            const auto & ahq = common_speculative_ahead_dists(spec.get(), slot.id);
+                            slot.spec_ahead_next_q.assign(ahq.begin() + 1, ahq.end());
+                        }
+                    }
+                    // [la-s0] the queued lookahead window [d4..]: keep it on a hit, drop it otherwise (before the memory rolls back below)
+                    if (llama_lookahead_pending(slot.ctx_tgt)) {
+                        // [la-dbg] LLAMA_LOOKAHEAD=2|3: always discard
+                        const int la_env = la_level(); // [la-ctl]
+                        if (hit && ah.size() == 4 && la_env < 2) {
+                            slot.la_resume_next = true;
+                        } else {
+                            llama_decode_discard(slot.ctx_tgt);
+                        }
+                    }
+                    if (alog) {
+                        n_avail += ah.empty() ? 0 : 1;
+                        n_hit   += hit ? 1 : 0;
+                        if (++n_win % 500 == 0) {
+                            fprintf(stderr, "[draft-ahead] windows=%" PRId64 " with ahead=%" PRId64 " hits=%" PRId64 "\n", n_win, n_avail, n_hit);
+                        }
+                    }
+                }
+
                 slot.spec_draft = std::move(accepted);
             }
 
@@ -4052,7 +4240,9 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (!slot.la_resume_next) { // [la-s0] a kept lookahead window already holds the next positions
+                slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            }
             spec_phase_lap(11, post_mark);
 
             for (size_t i = 0; i < ids.size(); ++i) {
@@ -4067,12 +4257,31 @@ private:
                 slot.stats.n_gen += 1;
 
                 if (!process_token(result, slot)) {
+                    if (slot.la_resume_next) { // [la-s0]
+                        llama_decode_discard(slot.ctx_tgt);
+                        slot.la_resume_next = false;
+                    }
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
 
                     return;
                 }
+            }
+
+            // [draft-ahead] the next window verifies the rest of the ahead tokens without a draft call
+            if (!slot.spec_ahead_next.empty()) {
+                if (slot.get_n_draft_max() >= (int) slot.spec_ahead_next.size()) {
+                    slot.spec_draft = std::move(slot.spec_ahead_next);
+                    slot.spec_draft_q = std::move(slot.spec_ahead_next_q); // [la-s0b] empty for greedy drafts
+                    slot.spec_q_keep = !slot.spec_draft_q.empty();
+                    slot.stats.n_draft_tokens += slot.spec_draft.size();
+                    common_speculative_ahead_commit(spec.get(), slot.id);
+                } else if (slot.la_resume_next) {
+                    llama_decode_discard(slot.ctx_tgt); // [la-s0]
+                    slot.la_resume_next = false;
+                }
+                slot.spec_ahead_next.clear();
             }
 
             slot.print_timings_tg();

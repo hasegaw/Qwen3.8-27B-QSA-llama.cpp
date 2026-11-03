@@ -95,6 +95,34 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// [mtp-kvonly] QWEN4EXP MTP context: while set, a decode builds only the cache writes of the MTP block (attention K/V,
+// raw indexer keys, pooled block keys) - no attention, FFN, head or outputs. For catch-up rows that request nothing.
+LLAMA_API void llama_set_mtp_kv_only(struct llama_context * ctx, bool value);
+
+// [la-s0] LLAMA_LOOKAHEAD: queue the GPU0 part of the next verify window while the current one finishes on GPU1 (two GPUs, pipeline
+// parallel); then either resume it with the same batch (only its remaining part runs) or discard it. 0 = queued, 1 = not queued
+LLAMA_API int32_t llama_decode_lookahead(struct llama_context * ctx, struct llama_batch batch);
+LLAMA_API int32_t llama_decode_resume   (struct llama_context * ctx, struct llama_batch batch);
+LLAMA_API void    llama_decode_discard  (struct llama_context * ctx);
+LLAMA_API bool    llama_lookahead_pending(const struct llama_context * ctx);
+
+// [pp-plan-hint] prompt tokens left after the batch of the next decode call (LLAMA_PP_PLAN_HINT=1 with LLAMA_PP_PLAN_AHEAD=1): pp plan-ahead
+// reserves for the prompt's end once instead of at every call. Cleared by each decode call.
+LLAMA_API void llama_set_pp_plan_hint(struct llama_context * ctx, uint32_t n_tokens);
+
+// [mtp-lag] the unmasked nextn rows of consecutive decode calls alternate between two host buffers. _call: id of the most recent
+// call's rows (0 = off). _prev(id): the rows of the call before the most recent one if that call is `id`, after waiting only for
+// its copies; NULL if they are gone.
+LLAMA_API void          llama_set_embeddings_nextn_lag (struct llama_context * ctx, bool value);
+LLAMA_API uint64_t      llama_get_embeddings_nextn_call(struct llama_context * ctx);
+LLAMA_API const float * llama_get_embeddings_nextn_prev(struct llama_context * ctx, uint64_t call_id);
+
+// [mtp-async] the MTP context's kv-only catch-up decode on a worker thread (LLAMA_MTP_ASYNC=1). Every llama_* call on that context
+// and every llama_memory_* call on its memory waits for it first; llama_async_join waits and returns the decode status.
+LLAMA_API void    llama_decode_kv_only_async(struct llama_context * ctx, struct llama_batch batch);
+LLAMA_API int32_t llama_async_join          (struct llama_context * ctx);
+LLAMA_API int32_t llama_async_join_by       (struct llama_context * ctx, const char * who); // [mtp-async-trace]
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

@@ -7,6 +7,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-a7.h"
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -1103,9 +1104,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ALLREDUCE",
     "ARGMAX_SPLIT",
     "HC_FUSED",
+    "A7_GDN_FFN",
+    "A7_GDN_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1222,9 +1225,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "allreduce(x)",
     "argmax_split(x)",
     "hc_fused(x)",
+    "a7_gdn_ffn(x)",
+    "a7_gdn_attn(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2634,6 +2639,125 @@ struct ggml_tensor * ggml_hc_combine(
     result->src[0] = x;
     result->src[1] = block_out;
     result->src[2] = down;
+    return result;
+}
+
+// ggml_a7_gdn_ffn
+
+struct ggml_tensor * ggml_a7_gdn_ffn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * res_hc,
+        struct ggml_tensor  * anchor,
+        struct ggml_tensor  * prod_ref,
+        const struct ggml_a7_ffn_layer * L,
+        int                   rq_ready) {
+    GGML_ASSERT(L != NULL);
+    GGML_ASSERT(res_hc->type == GGML_TYPE_F32 && ggml_is_contiguous(res_hc));
+    GGML_ASSERT(anchor != NULL);
+    if (prod_ref) {
+        GGML_ASSERT(prod_ref->type == GGML_TYPE_F32 && ggml_are_same_shape(prod_ref, res_hc) && ggml_is_contiguous(prod_ref));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, res_hc->ne[0], res_hc->ne[1], res_hc->ne[2]);
+    // op_params[0..1]: the pointer to the host struct (the model keeps it alive), op_params[2]: the layer index (log only)
+    // op_params[3]: rq_ready (P2): the q8 of R * hc_ffn_norm in the work area is already made (by the attn op of the same layer)
+    int32_t params[4] = { 0, 0, 0, 0 };
+    GGML_ASSERT(sizeof(L) <= 2*sizeof(int32_t));
+    memcpy(&params[0], &L, sizeof(L));
+    params[2] = L->il;
+    params[3] = rq_ready ? 1 : 0;
+    result->op     = GGML_OP_A7_GDN_FFN;
+    result->src[0] = res_hc;
+    result->src[1] = anchor;
+    result->src[2] = prod_ref;
+    ggml_set_op_params(result, params, sizeof(params));
+    return result;
+}
+
+// ggml_a7_gdn_attn
+
+struct ggml_tensor * ggml_a7_gdn_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * res_hc,
+        struct ggml_tensor  * anchor,
+        struct ggml_tensor  * s_copy,
+        struct ggml_tensor  * conv_all,
+        struct ggml_tensor  * ssm_all,
+        const struct ggml_a7_attn_layer * L) {
+    GGML_ASSERT(L != NULL);
+    GGML_ASSERT(res_hc->type == GGML_TYPE_F32 && ggml_is_contiguous(res_hc));
+    GGML_ASSERT(anchor != NULL && s_copy != NULL && conv_all != NULL && ssm_all != NULL);
+    GGML_ASSERT(s_copy->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, res_hc->ne[0], res_hc->ne[1], res_hc->ne[2]);
+    // op_params: [0..1] pointer to the host struct (the model keeps it alive), [2] kv_head, [3] mem_size, [4] K, [5] rq_ready, [6] eps (float bits),
+    // [7] mode (0 = compute, 1 = check-mode comparison), [8] check (1 = conv_all / ssm_all are the work copies of the check mode); [2..6], [8] by ggml_a7_gdn_attn_params
+    int32_t params[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    GGML_ASSERT(sizeof(L) <= 2*sizeof(int32_t));
+    memcpy(&params[0], &L, sizeof(L));
+    result->op     = GGML_OP_A7_GDN_ATTN;
+    result->src[0] = res_hc;
+    result->src[1] = anchor;
+    result->src[2] = s_copy;
+    result->src[3] = conv_all;
+    result->src[4] = ssm_all;
+    ggml_set_op_params(result, params, sizeof(params));
+    return result;
+}
+
+void ggml_a7_gdn_attn_params(
+        struct ggml_tensor * op,
+        int                  kv_head,
+        int                  mem_size,
+        int                  K,
+        int                  rq_ready,
+        float                eps,
+        int                  check) {
+    GGML_ASSERT(op->op == GGML_OP_A7_GDN_ATTN);
+    ggml_set_op_params_i32(op, 2, kv_head);
+    ggml_set_op_params_i32(op, 3, mem_size);
+    ggml_set_op_params_i32(op, 4, K);
+    ggml_set_op_params_i32(op, 5, rq_ready ? 1 : 0);
+    ggml_set_op_params_f32(op, 6, eps);
+    ggml_set_op_params_i32(op, 8, check ? 1 : 0);
+}
+
+struct ggml_tensor * ggml_a7_gdn_attn_cmp(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * r_a7,
+        struct ggml_tensor  * r_prod,
+        struct ggml_tensor  * res_in,
+        struct ggml_tensor  * s_copy,
+        struct ggml_tensor  * conv_w,
+        struct ggml_tensor  * ssm_w,
+        struct ggml_tensor  * conv_all,
+        struct ggml_tensor  * ssm_all,
+        const struct ggml_a7_attn_layer * L,
+        int                   kv_head,
+        int                   mem_size,
+        int                   K) {
+    GGML_ASSERT(L != NULL);
+    GGML_ASSERT(r_prod->type == GGML_TYPE_F32 && ggml_is_contiguous(r_prod));
+    GGML_ASSERT(ggml_are_same_shape(r_a7, r_prod) && ggml_are_same_shape(res_in, r_prod));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, r_prod->ne[0], r_prod->ne[1], r_prod->ne[2]);
+    int32_t params[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    memcpy(&params[0], &L, sizeof(L));
+    params[2] = kv_head;
+    params[3] = mem_size;
+    params[4] = K;
+    params[7] = 1;  // mode 1
+    result->op     = GGML_OP_A7_GDN_ATTN;
+    result->src[0] = r_a7;
+    result->src[1] = r_prod;
+    result->src[2] = s_copy;
+    result->src[3] = conv_w;
+    result->src[4] = ssm_w;
+    result->src[5] = conv_all;
+    result->src[6] = ssm_all;
+    result->src[7] = res_in;
+    result->src[8] = (struct ggml_tensor *) L->hc_norm;  // a weight of the layer: places the node on the layer's device
+    ggml_set_op_params(result, params, sizeof(params));
     return result;
 }
 

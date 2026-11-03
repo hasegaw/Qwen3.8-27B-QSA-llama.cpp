@@ -604,6 +604,8 @@ extern "C" {
         GGML_OP_ALLREDUCE, // in-place sum across devices, created by the meta backend only
         GGML_OP_ARGMAX_SPLIT,
         GGML_OP_HC_FUSED,
+        GGML_OP_A7_GDN_FFN,
+        GGML_OP_A7_GDN_ATTN,
 
         GGML_OP_COUNT,
     };
@@ -2769,6 +2771,66 @@ extern "C" {
             struct ggml_tensor  * block_out,
             struct ggml_tensor  * x,
             struct ggml_tensor  * down);
+
+    // A7 P1: the second half of a GDN layer (hc_mix(ffn) -> router -> MoE -> shared expert -> hc_combine(ffn)) as one op, T = 4 only.
+    //   res_hc [n_embd, hc, 4] F32 contiguous: the residual after the attention-side combine (not modified)
+    //   anchor: the layer's hc_ffn_norm (a src only so that the scheduler puts the op on the layer's GPU)
+    //   prod_ref: NULL, or (check mode) the result of the production path, same shape; the op then compares with it (A7CHECK line) and copies it to dst
+    //   L: the layer's weights (ggml-a7.h); the pointer is kept in op_params[0..1], the layer index in op_params[2]
+    //   rq_ready (op_params[3], P2): 1 = the q8 of R * hc_ffn_norm in the work area was made by the attn op of the same layer, skip the q8 at the head
+    //   -> new res_hc, same shape as res_hc
+    struct ggml_a7_ffn_layer;
+    GGML_API struct ggml_tensor * ggml_a7_gdn_ffn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * res_hc,
+            struct ggml_tensor  * anchor,
+            struct ggml_tensor  * prod_ref,
+            const struct ggml_a7_ffn_layer * L,
+            int                   rq_ready);
+
+    // A7 P2: the first half of a GDN layer (hc_mix(attn) -> qkv / z / alpha / beta -> conv -> l2 norm -> delta rule -> gated norm -> ssm_out
+    // -> hc_combine(attn)) as one op, T = 4 only. The op reads and writes the recurrent state buffers r_l / s_l directly.
+    //   res_hc [n_embd, hc, 4] F32 contiguous: the residual entering the layer (not modified)
+    //   anchor: the layer's hc_attn_norm (a src only so that the scheduler puts the op on the layer's GPU)
+    //   s_copy: I32 [n_seqs = 1] (read on the device: row of the state to read)
+    //   conv_all / ssm_all: mctx->get_r_l(il) / get_s_l(il) (F32), or in check mode the work copies
+    //   L: the layer's weights (ggml-a7.h); op_params: [0..1] L, [2] kv_head, [3] mem_size, [4] K, [5] rq_ready, [6] eps (float bits), [7] mode, [8] check
+    //   -> new res_hc, same shape as res_hc
+    struct ggml_a7_attn_layer;
+    GGML_API struct ggml_tensor * ggml_a7_gdn_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * res_hc,
+            struct ggml_tensor  * anchor,
+            struct ggml_tensor  * s_copy,
+            struct ggml_tensor  * conv_all,
+            struct ggml_tensor  * ssm_all,
+            const struct ggml_a7_attn_layer * L);
+    // sets op_params [2..6] and [8] of a node made by ggml_a7_gdn_attn (check = 1: conv_all / ssm_all are the work copies)
+    GGML_API void ggml_a7_gdn_attn_params(
+            struct ggml_tensor * op,
+            int                  kv_head,
+            int                  mem_size,
+            int                  K,
+            int                  rq_ready,
+            float                eps,
+            int                  check);
+    // the comparison node of the check mode (the same op, mode 1): compares the A7 result r_a7 with the production result r_prod (relative to the
+    // input residual res_in), and the state rows (s * mem_size + kv_head, s < K) of the work copies conv_w / ssm_w with those of the production buffers
+    // conv_all / ssm_all. dst = a copy of r_prod, the model continues with it.
+    GGML_API struct ggml_tensor * ggml_a7_gdn_attn_cmp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r_a7,
+            struct ggml_tensor  * r_prod,
+            struct ggml_tensor  * res_in,
+            struct ggml_tensor  * s_copy,
+            struct ggml_tensor  * conv_w,
+            struct ggml_tensor  * ssm_w,
+            struct ggml_tensor  * conv_all,
+            struct ggml_tensor  * ssm_all,
+            const struct ggml_a7_attn_layer * L,
+            int                   kv_head,
+            int                   mem_size,
+            int                   K);
 
     // custom operators
 

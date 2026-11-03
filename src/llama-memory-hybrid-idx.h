@@ -87,7 +87,22 @@ public:
     llama_kv_cache * get_mem_blk() const;   // nullptr when the model carries no indexer
     uint32_t get_blk_ratio() const { return blk_ratio; }
     bool     get_blk_valid() const { return blk_valid; }
-    void     set_blk_valid(bool v) const { blk_valid = v; }
+    // [blk-rebuild] dropping validity also drops a pending rebuild: there is no valid layout to rebuild into
+    void     set_blk_valid(bool v) const { blk_valid = v; if (!v) { blk_rebuild = false; blk_rebuild_tries = 0; } }   // [blk-rebuild2]
+
+    // [blk-rebuild] LLAMA_QSA_BLK_REBUILD=1 only. A restored state whose cell layout passes blk_layout_ok() is marked valid again
+    // with this flag set: the pooled rows are stale (they are not part of the saved state), so the next ubatch re-pools every
+    // block from the restored raw indexer keys, and the flag is cleared once that ubatch went through
+    bool     get_blk_rebuild() const { return blk_rebuild; }
+    void     set_blk_rebuild(bool v) const { blk_rebuild = v; blk_rebuild_tries = 0; }   // [blk-rebuild2] the counter restarts with the flag
+
+    // [blk-rebuild2] apply() calls that captured the pending rebuild since the last next() or invalidation. apply() runs once per
+    // ubatch attempt, so finding this > 0 at the next apply() means the attempt that captured it never reached next(): it failed
+    uint32_t get_blk_rebuild_tries() const { return blk_rebuild_tries; }
+    void     set_blk_rebuild_tries(uint32_t n) const { blk_rebuild_tries = n; }
+
+    // [blk-rebuild2] "target" for a memory with recurrent layers, "draft" for the attention-only MTP draft; for log lines
+    const char * get_blk_who() const { return has_recurrent ? "target" : "draft"; }
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
@@ -106,6 +121,12 @@ private:
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
+    // [blk-rebuild] true if the cells of the attention and the indexer cache (stream 0) are the layout the pooled block keys assume:
+    // cells 0..n-1 hold seq 0 only, in strictly increasing (pos, y, x) order, position 0 first
+    // [blk-rebuild2] it does not promise one position per text cell: the check meant for that is inert here, see blk_layout_ok
+    // on failure *why points to a static string naming the first condition that failed
+    bool blk_layout_ok(const char ** why) const;
+
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
@@ -116,6 +137,8 @@ private:
 
     uint32_t blk_ratio = 0;
     mutable bool blk_valid = true;
+    mutable bool blk_rebuild = false;   // [blk-rebuild] valid, but the pooled rows are stale until the next ubatch re-pools them
+    mutable uint32_t blk_rebuild_tries = 0;   // [blk-rebuild2] see get_blk_rebuild_tries()
     std::unique_ptr<llama_kv_cache> mem_blk;
 };
 
@@ -162,6 +185,9 @@ public:
     llama_kv_cache * get_blk() const;
     bool blk_ok() const;
 
+    // [blk-rebuild] the current ubatch must re-pool every block, not only the ones it touches (decided in apply())
+    bool blk_rebuild() const { return blk_rebuild_cur; }
+
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
@@ -181,4 +207,7 @@ private:
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
+
+    // [blk-rebuild] set by apply() for the ubatch being processed, confirmed by next()
+    bool blk_rebuild_cur = false;
 };

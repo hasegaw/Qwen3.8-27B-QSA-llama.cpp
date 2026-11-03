@@ -14,6 +14,8 @@
 
 #include <array>
 #include <map>
+#include <mutex>  // [mtp-async]
+#include <thread> // [mtp-async]
 #include <vector>
 
 struct llama_model;
@@ -116,6 +118,14 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_mtp_kv_only(bool value); // [mtp-kvonly]
+    void set_pp_plan_hint(uint32_t n_tokens); // [pp-plan-hint]
+    void set_embeddings_nextn_lag(bool value); // [mtp-lag]
+    void    decode_kv_only_async(const llama_batch & batch); // [mtp-async]
+    int32_t async_join(); // [mtp-async] waits for a pending decode_kv_only_async, returns its status
+    bool    async_rm_is_noop(llama_seq_id seq_id, llama_pos p0, llama_pos p1); // [mtp-async-rmskip]
+    uint64_t      get_embeddings_nextn_call() const; // [mtp-lag]
+    const float * get_embeddings_nextn_prev(uint64_t call_id); // [mtp-lag]
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -144,6 +154,12 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    // [la-s0] stage-0 lookahead (llama-ext.h)
+    int  decode_lookahead(const llama_batch & batch_inp);
+    int  decode_resume(const llama_batch & batch_inp);
+    void decode_discard();
+    bool lookahead_pending() const { return la_pending; }
 
     //
     // state save/load
@@ -238,11 +254,40 @@ private:
     };
     std::vector<logits_pending_copy> logits_pending;
     std::vector<int32_t>             argmax_ids; // per output row, -1 when not computed
+    // [draft-ahead] LLAMA_DRAFT_AHEAD>0 or LLAMA_ARGMAX_PIN=1: the argmax rows of a decode are copied into pinned memory and moved
+    // into argmax_ids at synchronize(), so llama_decode returns before the GPUs finish (a pageable copy waits for them)
+    ggml_backend_buffer_ptr buf_argmax_pin;
+    int32_t * argmax_pin     = nullptr;
+    int64_t   argmax_pin_cap = 0;
+    int64_t   argmax_pin_n   = 0; // rows of the last decode not yet moved into argmax_ids
+
+    // [la-s0] stage-0 lookahead: la_mode 1 inside decode_lookahead, 2 inside decode_resume; la_pending = a stage 0 waits for resume/discard
+    int            la_mode    = 0;
+    bool           la_pending = false;
+    int            la_split   = -1;      // first split of the second GPU
+    llama_pos      la_pos0    = -1;
+    llama_seq_id   la_seq     = 0;
+    ggml_backend_t la_be0     = nullptr; // GPU0's backend (not waited for while la_pending)
+    bool           la_restore_inflight = false; // [la-sync] a discard queued g_restore on GPU0; the next synchronize() waits for it
+    std::unique_ptr<llama_batch_allocr> balloc_la;
+    llama_memory_context_ptr            mctx_la;
     void logits_flush(bool sync);
+
+    // [gpu-topk] device top-K of every output row (LLAMA_GPU_TOPK): ids then values in one pinned host buffer, rows of topk_k entries
+    ggml_backend_buffer_ptr buf_topk;
+    int32_t *            topk_ids  = nullptr;
+    float *              topk_vals = nullptr;
+    int64_t              topk_k    = 0;
+    int64_t              topk_cap  = 0; // rows
+    std::vector<uint8_t> topk_ok;       // per output row: 1 when its top-K was copied by the current decode
+    bool topk_reserve(int64_t n_rows);
 
 public:
     // greedy token of output i computed on the device, or LLAMA_TOKEN_NULL
     llama_token get_argmax_ith(int32_t i);
+
+    // [gpu-topk] K and the device top-K (ids, raw logits; unordered) of output i, or 0 when not available; no logits copy
+    int32_t get_topk_ith(int32_t i, const llama_token ** ids, const float ** vals);
 
 private:
 
@@ -265,6 +310,7 @@ public:
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute_la(ggml_cgraph * gf); // [la-s0] the splits of the current stage
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -409,6 +455,57 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // [reserve-heal] env: LLAMA_RESERVE_HEAL=1 (custom tree; see patch-mt-reserveheal.py)
+    bool reserve_heal      = false;
+    bool reserve_trace     = false; // [reserve-trace] env: LLAMA_RESERVE_TRACE=1
+    int  trace_nf_seen     = 0;     // [reserve-trace2] per context: each context has its own scheduler
+    bool heal_pending      = false;
+    int  heal_nf_prev      = 0;   // scheduler fallback re-reserves seen so far
+    int  heal_last_nodes   = -1;  // node count of the last graph that fell back
+    int  heal_done_nodes   = -1;  // node count the last heal was for
+    int  n_heal            = 0;
+    std::vector<int> heal_failed; // node counts a heal did not help
+    void heal_reserve(const llama_ubatch & ubatch, llm_graph_type gtype);
+
+    // [pp-plan-ahead] env: LLAMA_PP_PLAN_AHEAD=1 (custom tree; see patch-mt-planahead.py). With pipeline parallelism, reserve the
+    // scheduler once per decode call with the n_kv of the call's last ubatch, so the later ubatches do not re-reserve
+    bool     pp_plan_ahead     = false;
+    uint32_t pp_plan_remaining = 0;     // tokens of this decode call after the ubatch being processed (0 outside decode)
+    bool     pp_plan_done      = false; // already planned in this decode call
+    int      pp_plan_count     = 0;     // plans made in this decode call (at most 4)
+    uint32_t pp_plan_max_kv    = 32768; // env LLAMA_PP_PLAN_AHEAD_MAX_KV, 0 = no cap; see patch-mt-planahead.py
+    int      n_plan            = 0;
+    // 1 = reserved with a plan graph, 0 = no graph of the real graph's node count was found, -1 = reserve failed
+    int plan_reserve(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, int target_nodes);
+
+    // [pp-plan-hint] env LLAMA_PP_PLAN_HINT=1 (see patch-mt-mtplag.py): the server passes the prompt tokens left after the batch, so the
+    // first plan covers the prompt's end and later calls skip the plan (a reserve synchronizes all GPUs) while it still covers them
+    bool     pp_plan_hint_on   = false;
+    uint32_t pp_plan_hint      = 0; // set before a decode call, cleared at its end
+    int64_t  pp_plan_cover_pos = 0; // cells (last pos + 1 + planned tokens) the last successful plan covered, 0 = none
+    int64_t  pp_plan_cur_end   = 0; // last pos + 1 of the ubatch being processed
+    int64_t  pp_plan_dense_end = 0; // [pp-plan-hint-dense] v2: a prompt ubatch whose first pos + 1 is below this takes the dense QSA path
+    uint32_t pp_plan_extra_limit = UINT32_MAX; // [pp-plan-hint-dense] v2: cap on the planned tokens for the plan being made
+
+    // [mtp-lag] unmasked nextn rows of consecutive decode calls alternate between the buf_output view (0) and nextn_alt_buf (1);
+    // each call records an event after its last row copy (see llama_get_embeddings_nextn_prev)
+    bool                    nextn_lag     = false;
+
+    // [mtp-async] the worker of decode_kv_only_async (see patch-mt-mtpasync.py)
+    std::thread async_th;
+    std::mutex  async_mtx;
+    int32_t     async_rc = 0;
+    // [mtp-async-rmskip] what the running catch-up can touch: one sequence, positions up to async_hi (incl. the memory's end before it)
+    llama_seq_id async_seq = -1;
+    llama_pos    async_hi  = -1;
+    int                     nextn_flip    = 0;
+    ggml_backend_buffer_ptr nextn_alt_buf;
+    float *                 nextn_ptr[2]  = { nullptr, nullptr };
+    uint64_t                nextn_call[2] = { 0, 0 }; // call id whose rows each buffer holds, 0 = none
+    uint64_t                nextn_calls   = 0;
+    ggml_backend_event_t    nextn_ev[2]   = { nullptr, nullptr };
+    ggml_backend_t          nextn_backend = nullptr; // backend of the current call's last row copy
 
     // perf
     mutable int64_t t_start_us  = 0;

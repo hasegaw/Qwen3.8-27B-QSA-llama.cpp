@@ -69,6 +69,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // the target's temp and seed, read only when the drafter samples probabilistically
+    float    temp = 1.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -88,6 +95,17 @@ void common_speculative_accept_feedback(common_speculative * spec, llama_seq_id 
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// [draft-ahead] LLAMA_DRAFT_AHEAD=N (draft-mtp, fold, one sequence, greedy drafts): continue the last full draft by N tokens
+// while the target verifies it (call between llama_decode and llama_synchronize of the target)
+bool common_speculative_ahead_pending(common_speculative * spec, llama_seq_id seq_id);
+void common_speculative_draft_ahead(common_speculative * spec, llama_seq_id seq_id);
+// the continuation of the last draft (empty if none)
+const llama_tokens & common_speculative_ahead_tokens(common_speculative * spec, llama_seq_id seq_id);
+// [la-s0b] the draft distribution of each ahead token (empty for greedy drafts)
+const std::vector<std::vector<llama_token_data>> & common_speculative_ahead_dists(common_speculative * spec, llama_seq_id seq_id);
+// the next verification uses ahead tokens as its draft (no draft call before it)
+void common_speculative_ahead_commit(common_speculative * spec, llama_seq_id seq_id);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

@@ -682,6 +682,9 @@ struct llama_model {
     struct ggml_tensor * fc   = nullptr;
     struct ggml_tensor * fc_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
+    struct ggml_tensor * mtp_dv_head = nullptr; // [mtp-draft-vocab] rows of the MTP LM head for LLAMA_MTP_DRAFT_VOCAB's token ids
+    struct ggml_tensor * mtp_dv_d2t  = nullptr; // [mtp-draft-vocab] I64 target token id of each row
+    const  ggml_tensor * mtp_dv_src  = nullptr; // [mtp-draft-vocab] the head tensor mtp_dv_head was cut from
 
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;
@@ -717,6 +720,9 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // which tensors can be prefetched - driven by TENSOR_READ_LAZY
+    std::unordered_set<const ggml_tensor *> can_prefetch;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

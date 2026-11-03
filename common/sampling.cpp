@@ -12,8 +12,87 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
+#include <atomic>
+#include <cstdlib>
 #include <vector>
+
+// [sample-topk] env LLAMA_SAMPLE_TOPK (patch-mt-sampletopk.py): 0/unset = off, 1 = on, 2 = on + check against the full array
+static int common_sampler_topk_mode() {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_SAMPLE_TOPK");
+        const int m = e ? atoi(e) : 0;
+        if (m > 0) {
+            LOG_WRN("[sample-topk] LLAMA_SAMPLE_TOPK=%d: top-k candidates without the full-vocabulary array%s\n", m, m >= 2 ? " (check mode)" : "");
+        }
+        return m;
+    }();
+    return mode;
+}
+
+// [sample-topk] k when top_k is the first sampler of the chain that changes anything, else 0
+static int common_sampler_topk_prefilter_k(const common_params_sampling & p) {
+    if (common_sampler_topk_mode() <= 0 || p.mirostat != 0 || p.n_probs > 0 || p.top_k <= 0 || p.top_k > 128) {
+        return 0;
+    }
+    for (const auto & s : p.samplers) {
+        switch (s) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                return p.top_k;
+            case COMMON_SAMPLER_TYPE_PENALTIES: // llama_sampler_penalties::is_disabled
+                if (p.penalty_last_n == 0 || (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f)) {
+                    continue;
+                }
+                return 0;
+            case COMMON_SAMPLER_TYPE_DRY: // llama_sampler_init_dry returns an empty sampler
+                if (p.dry_multiplier == 0.0f || p.dry_base < 1.0f || p.dry_penalty_last_n <= 0) {
+                    continue;
+                }
+                return 0;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (p.top_n_sigma <= 0.0f) {
+                    continue;
+                }
+                return 0;
+            default:
+                return 0;
+        }
+    }
+    return 0;
+}
+
+struct common_sampler_topk_stats {
+    std::atomic<int64_t> checked {0};
+    std::atomic<int64_t> bad_id  {0};
+    std::atomic<int64_t> bad_cand{0};
+};
+
+static common_sampler_topk_stats g_topk_stats;
+
+// [gpu-topk] set_logits from the device top-K (llama_get_topk_ith, LLAMA_GPU_TOPK, patch-mt-gputopk.py): uses, fallbacks to the CPU scan
+// of the row by reason, and the check-mode results of the device path
+struct common_sampler_gputopk_stats {
+    std::atomic<int64_t> used    {0};
+    std::atomic<int64_t> fb_none {0}; // no device top-K for the row (LLAMA_GPU_TOPK unset, tensor split, ...)
+    std::atomic<int64_t> fb_k    {0}; // K < k
+    std::atomic<int64_t> fb_bias {0}; // a logit_bias entry > 0 / NaN / out of range / duplicated, or a bad device entry (id, NaN)
+    std::atomic<int64_t> fb_exact{0}; // the k-th best is not strictly above the smallest device value: exactness not provable
+    std::atomic<int64_t> checked {0};
+    std::atomic<int64_t> bad     {0};
+};
+
+static common_sampler_gputopk_stats g_gputopk_stats;
+
+// [gpu-topk] the last set_logits of this thread took the device path (read by the check in common_sampler_sample)
+static thread_local bool tl_gputopk_used = false;
+
+static void common_sampler_gputopk_log(const char * what) {
+    const auto & g = g_gputopk_stats;
+    LOG_WRN("[gpu-topk] %s: device path %lld, CPU scan: no device top-K %lld, K < k %lld, bias %lld, not provable %lld; checked %lld, mismatches %lld\n",
+        what, (long long) g.used.load(), (long long) g.fb_none.load(), (long long) g.fb_k.load(), (long long) g.fb_bias.load(),
+        (long long) g.fb_exact.load(), (long long) g.checked.load(), (long long) g.bad.load());
+}
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -121,13 +200,20 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // for rejection sampling; independent of the draft, or the target distribution is not preserved
+    std::mt19937 rng;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    // [sample-topk] allow_topk: the caller runs the chain on cur without applying the grammar or a forcing reasoning budget first;
+    // returns true when cur holds only the top-k candidates
+    bool set_logits(struct llama_context * ctx, int idx, bool allow_topk = false) {
+        bool used_topk = false;
+        tl_gputopk_used = false; // [gpu-topk]
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -150,15 +236,223 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
-            const auto * logits = llama_get_logits_ith(ctx, idx);
-            GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            // [gpu-topk] the device top-K first: when it decides, the logits row is neither read nor copied to the host
+            used_topk = allow_topk && set_logits_topk_device(ctx, idx, n_vocab, vocab);
+            if (!used_topk) {
+                const auto * logits = llama_get_logits_ith(ctx, idx);
+                GGML_ASSERT(logits != nullptr);
+                used_topk = allow_topk && set_logits_topk(logits, n_vocab, vocab);
+                if (!used_topk) {
+                    cur.resize(n_vocab);
+                    for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                        cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                    }
+                }
             }
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+
+        return used_topk;
+    }
+
+    // [gpu-topk] the selection of set_logits_topk from the device top-K of output idx (llama_get_topk_ith): the K largest raw logits and
+    // their ids, without reading the logits row (a deferred row is then never copied to the host). All biases must be <= 0: a token outside
+    // the K then has biased <= raw <= the smallest device value, so when the k-th best biased value among the K is strictly greater than
+    // that value, the k best of the K are the k best of the vocabulary. false (cur untouched): the caller scans the row (v2) as before
+    bool set_logits_topk_device(struct llama_context * ctx, int idx, int n_vocab, const llama_vocab * vocab) {
+        const int k = common_sampler_topk_prefilter_k(params);
+        if (k <= 0) {
+            return false;
+        }
+
+        const llama_token * d_ids  = nullptr;
+        const float       * d_vals = nullptr;
+        const int K = llama_get_topk_ith(ctx, idx, &d_ids, &d_vals);
+        if (K <= 0 || d_ids == nullptr || d_vals == nullptr) {
+            ++g_gputopk_stats.fb_none;
+            return false;
+        }
+        if (K < k) {
+            ++g_gputopk_stats.fb_k;
+            return false;
+        }
+
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+
+        static thread_local std::vector<llama_logit_bias> dbias;
+        dbias.clear();
+        for (const auto & lb : params.logit_bias) {
+            dbias.push_back(lb);
+        }
+        for (int32_t i = 0; i < n_suppress; ++i) {
+            dbias.push_back({ suppress[i], -INFINITY });
+        }
+        for (size_t i = 0; i < dbias.size(); ++i) {
+            if (dbias[i].token < 0 || dbias[i].token >= n_vocab || !(dbias[i].bias <= 0.0f)) {
+                ++g_gputopk_stats.fb_bias;
+                return false;
+            }
+            for (size_t j = 0; j < i; ++j) {
+                if (dbias[j].token == dbias[i].token) {
+                    ++g_gputopk_stats.fb_bias;
+                    return false;
+                }
+            }
+        }
+
+        // the K device entries with their biased logit in .p
+        static thread_local std::vector<llama_token_data> dcand;
+        dcand.resize(K);
+        float min_raw = INFINITY;
+        for (int i = 0; i < K; ++i) {
+            const llama_token t   = d_ids[i];
+            const float       raw = d_vals[i];
+            if (t < 0 || t >= n_vocab || raw != raw) {
+                ++g_gputopk_stats.fb_bias;
+                return false;
+            }
+            float adj = raw;
+            for (const auto & lb : dbias) {
+                if (lb.token == t) {
+                    adj = raw + lb.bias;
+                }
+            }
+            dcand[i] = llama_token_data{ t, raw, adj };
+            min_raw = std::min(min_raw, raw);
+        }
+        std::partial_sort(dcand.begin(), dcand.begin() + k, dcand.end(),
+            [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
+        if (!(dcand[k - 1].p > min_raw)) {
+            ++g_gputopk_stats.fb_exact;
+            return false;
+        }
+        std::sort(dcand.begin(), dcand.begin() + k,
+            [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
+
+        cur.resize(k);
+        for (int i = 0; i < k; ++i) {
+            cur[i] = llama_token_data{ dcand[i].id, dcand[i].logit, 0.0f };
+        }
+
+        tl_gputopk_used = true;
+        const int64_t n = ++g_gputopk_stats.used;
+        if (n == 1) {
+            LOG_WRN("[gpu-topk] top-k candidates from the device top-%d (k = %d): the logits row is not read\n", K, k);
+        }
+        if (common_sampler_topk_mode() < 2 && n % 20000 == 0) {
+            common_sampler_gputopk_log("progress");
+        }
+        return true;
+    }
+
+    // [sample-topk] cur = the k tokens with the largest biased logit (raw logit + logit_bias entries, as the chain's logit_bias sampler
+    // adds them), with their raw logits, in ascending token id; false = not applicable, cur untouched
+    bool set_logits_topk(const float * logits, int n_vocab, const llama_vocab * vocab) {
+        const int k = common_sampler_topk_prefilter_k(params);
+        if (k <= 0) {
+            return false;
+        }
+
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+
+        static thread_local std::vector<llama_logit_bias> bias;
+        bias.clear();
+        for (const auto & lb : params.logit_bias) {
+            bias.push_back(lb);
+        }
+        for (int32_t i = 0; i < n_suppress; ++i) {
+            bias.push_back({ suppress[i], -INFINITY });
+        }
+        for (size_t i = 0; i < bias.size(); ++i) {
+            if (bias[i].token < 0 || bias[i].token >= n_vocab) {
+                return false;
+            }
+            for (size_t j = 0; j < i; ++j) {
+                if (bias[j].token == bias[i].token) {
+                    return false; // duplicates: logit_bias applies them differently to a full and a partial array
+                }
+            }
+        }
+
+        const int kk = k + (int) bias.size();
+        if (kk >= n_vocab) {
+            return false;
+        }
+
+        // the kk largest raw logits: min-heap on the logit, its root is the smallest kept
+        static thread_local std::vector<llama_token_data> heap;
+        heap.resize(kk);
+        for (int t = 0; t < kk; ++t) {
+            heap[t] = llama_token_data{ t, logits[t], 0.0f };
+        }
+        const auto cmp_min = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+        std::make_heap(heap.begin(), heap.end(), cmp_min);
+        float thr = heap.front().logit;
+        const auto push = [&](int t, float l) {
+            std::pop_heap(heap.begin(), heap.end(), cmp_min);
+            heap.back() = llama_token_data{ t, l, 0.0f };
+            std::push_heap(heap.begin(), heap.end(), cmp_min);
+            thr = heap.front().logit;
+        };
+        // blocks of 32 logits with none above the smallest kept one are skipped with a 4-wide compare (SSE2 / NEON baseline);
+        // the tokens are still visited in ascending order, so the result is that of the plain scan (52 -> 17 us per row, main PC)
+        typedef float topk_v4f __attribute__((vector_size(16)));
+        typedef int   topk_v4i __attribute__((vector_size(16)));
+        int t = kk;
+        for (; t < n_vocab && (t & 31); ++t) {
+            if (logits[t] > thr) { push(t, logits[t]); }
+        }
+        for (; t + 32 <= n_vocab; t += 32) {
+            const topk_v4f vt = { thr, thr, thr, thr };
+            topk_v4i acc = { 0, 0, 0, 0 };
+            for (int j = 0; j < 32; j += 4) {
+                topk_v4f v;
+                memcpy(&v, logits + t + j, sizeof(v));
+                acc |= (v > vt);
+            }
+            if ((acc[0] | acc[1] | acc[2] | acc[3]) == 0) {
+                continue;
+            }
+            for (int u = t; u < t + 32; ++u) {
+                if (logits[u] > thr) { push(u, logits[u]); }
+            }
+        }
+        for (; t < n_vocab; ++t) {
+            if (logits[t] > thr) { push(t, logits[t]); }
+        }
+
+        // candidates by biased logit (in .p): unbiased tokens of the heap + every biased token
+        static thread_local std::vector<llama_token_data> cand;
+        cand.clear();
+        for (const auto & e : heap) {
+            bool biased = false;
+            for (const auto & lb : bias) {
+                biased |= lb.token == e.id;
+            }
+            if (!biased) {
+                cand.push_back(llama_token_data{ e.id, e.logit, e.logit });
+            }
+        }
+        for (const auto & lb : bias) {
+            cand.push_back(llama_token_data{ lb.token, logits[lb.token], logits[lb.token] + lb.bias });
+        }
+        if ((int) cand.size() < k) {
+            return false;
+        }
+        std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
+            [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
+        std::sort(cand.begin(), cand.begin() + k,
+            [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
+
+        cur.resize(k);
+        for (int i = 0; i < k; ++i) {
+            cur[i] = llama_token_data{ cand[i].id, cand[i].logit, 0.0f };
+        }
+
+        return true;
     }
 
     common_time_meas tm() {
@@ -432,6 +726,8 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        // mix it, the chain and the draft are seeded from this one too
+        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
     return result;
@@ -515,6 +811,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .rng     = */ gsmpl->rng,
     };
 }
 
@@ -687,7 +984,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // [sample-topk] only when the chain is the first thing applied to cur (the grammar resampling below always uses the full array)
+    const bool topk_allow = common_sampler_topk_mode() > 0 &&
+        !(grammar_first && grammar_should_apply(gsmpl)) &&
+        !(rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING);
+
+    const bool topk_used = gsmpl->set_logits(ctx, idx, topk_allow);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -718,9 +1020,53 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &cur_p);
     }
 
+    // [sample-topk] check mode: a clone of the chain (same state, same RNG) samples the full array
+    llama_sampler * topk_chk = topk_used && common_sampler_topk_mode() >= 2 ? llama_sampler_clone(chain) : nullptr;
+
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+
+    if (topk_chk) {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        static thread_local std::vector<llama_token_data> full;
+        full.resize(n_vocab);
+        for (llama_token t = 0; t < n_vocab; t++) {
+            full[t] = llama_token_data{ t, logits[t], 0.0f };
+        }
+        llama_token_data_array full_p = { full.data(), full.size(), -1, false };
+        llama_sampler_apply(rbudget, &full_p);
+        llama_sampler_apply(topk_chk, &full_p);
+        llama_sampler_free(topk_chk);
+
+        const bool same_id = full_p.selected >= 0 && full_p.data[full_p.selected].id == id;
+        bool same_cand = full_p.size == cur_p.size;
+        for (size_t i = 0; same_cand && i < cur_p.size; ++i) {
+            same_cand = full_p.data[i].id == cur_p.data[i].id && full_p.data[i].p == cur_p.data[i].p;
+        }
+        const int64_t n = ++g_topk_stats.checked;
+        const int64_t bad_id = same_id ? g_topk_stats.bad_id.load() : ++g_topk_stats.bad_id;
+        const int64_t bad_cand = same_cand ? g_topk_stats.bad_cand.load() : ++g_topk_stats.bad_cand;
+        if (tl_gputopk_used) { // [gpu-topk] the device path's own count
+            ++g_gputopk_stats.checked;
+            if (!same_id || !same_cand) {
+                const int64_t nb = ++g_gputopk_stats.bad;
+                if (nb <= 20) {
+                    LOG_WRN("[gpu-topk] check mismatch on the device path #%lld: id %d vs full %d, candidates %zu vs full %zu\n", (long long) nb,
+                        id, full_p.selected >= 0 ? full_p.data[full_p.selected].id : -1, cur_p.size, full_p.size);
+                }
+            }
+        }
+        if ((!same_id || !same_cand) && bad_id + bad_cand <= 20) {
+            LOG_WRN("[sample-topk] check mismatch #%lld: id %d vs full %d, candidates %zu vs full %zu\n", (long long) (bad_id + bad_cand),
+                id, full_p.selected >= 0 ? full_p.data[full_p.selected].id : -1, cur_p.size, full_p.size);
+        }
+        if (n % 2000 == 0) {
+            LOG_WRN("[sample-topk] check: %lld checked, %lld id mismatches, %lld candidate mismatches\n", (long long) n, (long long) bad_id, (long long) bad_cand);
+            common_sampler_gputopk_log("check"); // [gpu-topk]
+        }
+    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
@@ -758,6 +1104,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+// [spec-acclog] LLAMA_SPEC_ACCLOG=<file>: one line per verified window (measurement only; patch-mt-specacclog.py)
+static FILE * spec_acclog_file() {
+    static FILE * f = [] {
+        const char * p = getenv("LLAMA_SPEC_ACCLOG");
+        return p != nullptr && *p != '\0' ? fopen(p, "a") : (FILE *) nullptr;
+    }();
+    return f;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
@@ -783,6 +1138,205 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+    }
+
+    if (FILE * f = spec_acclog_file()) {
+        fprintf(f, "G %zu %zu\n", draft.size(), result.size() - 1);
+        fflush(f);
+    }
+
+    return result;
+}
+
+static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+    for (size_t k = 0; k < n; ++k) {
+        if (data[k].id == id) {
+            return data[k].p;
+        }
+    }
+    return 0.0f;
+}
+
+// [spec-acclog] the window replayed on a clone of the sampler (taken before the window): target distribution at every draft
+// position along the drafted path, token-wise and block-verification expected accepted drafts
+static void spec_acclog_rejection(common_sampler * clone, llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_q, const size_t n_acc) {
+    FILE * f = spec_acclog_file();
+    const size_t n = draft.size();
+    std::vector<double> px(n, 0.0), qx(n, 0.0), S(n, 0.0), w(n + 1, 1.0);
+    int gram = 0;
+    for (size_t k = 0; k < n; ++k) {
+        common_sampler_sample(clone, ctx, idxs[k], false);
+        if (grammar_should_apply(clone)) {
+            gram = 1;
+        }
+        const auto * cur = common_sampler_get_candidates(clone, true);
+        std::unordered_map<llama_token, float> qm;
+        for (const auto & e : draft_q[k]) {
+            qm[e.id] = e.p;
+        }
+        const double a = w[k];
+        double sum = 0.0;
+        for (size_t j = 0; j < cur->size; ++j) {
+            const auto it = qm.find(cur->data[j].id);
+            const double qv = it == qm.end() ? 0.0 : it->second;
+            const double r  = a*cur->data[j].p - qv;
+            if (r > 0.0) {
+                sum += r;
+            }
+            if (cur->data[j].id == draft[k]) {
+                px[k] = cur->data[j].p;
+            }
+        }
+        const auto itq = qm.find(draft[k]);
+        qx[k]    = itq == qm.end() ? 0.0 : itq->second;
+        S[k]     = sum;
+        w[k + 1] = qx[k] > 0.0 ? std::min(1.0, a*px[k]/qx[k]) : 0.0;
+        common_sampler_accept(clone, draft[k], false);
+    }
+    double tw = 0.0, prod = 1.0;
+    for (size_t k = 0; k < n; ++k) {
+        prod *= qx[k] > 0.0 ? std::min(1.0, px[k]/qx[k]) : 0.0;
+        tw   += prod;
+    }
+    std::vector<double> h(n + 1, 0.0);
+    for (size_t i = 1; i < n; ++i) {
+        const double den = S[i] + 1.0 - w[i];
+        h[i] = den > 0.0 ? S[i]/den : 1.0;
+    }
+    if (n > 0) {
+        h[n] = w[n];
+    }
+    double bv = 0.0;
+    for (size_t i = 1; i <= n; ++i) {
+        double pi = h[i];
+        for (size_t j = i + 1; j <= n; ++j) {
+            pi *= 1.0 - h[j];
+        }
+        bv += i*pi;
+    }
+    fprintf(f, "R %zu %zu %d %.5f %.5f", n, n_acc, gram, tw, bv);
+    for (size_t k = 0; k < n; ++k) {
+        fprintf(f, " %.5g/%.5g/%.5g", px[k], qx[k], S[k]);
+    }
+    fputc('\n', f);
+    fflush(f);
+}
+
+// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
+// Preserves the target distribution exactly, and accepts more often than matching does when the
+// draft samples instead of taking its argmax.
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, bool bonus) {
+    GGML_ASSERT(idxs.size()    == draft.size() + (bonus ? 1 : 0) && "idxs.size() must be draft.size() + 1 (draft.size() without a bonus) [la-s0b]");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    // [spec-acclog] the sampler as it was before this window
+    common_sampler * acl_clone = spec_acclog_file() != nullptr ? common_sampler_clone(gsmpl) : nullptr;
+
+    // draws come from the sampler's own stream, so they stay independent of what was drafted
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+
+    std::vector<llama_token_data> residual;
+
+    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // leaves the target distribution in the candidate array
+        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        const auto & q     = draft_q[i];
+
+        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
+        if (masked) {
+            cand.assign(cur_p->data, cur_p->data + cur_p->size);
+            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+            llama_sampler_apply(gsmpl->grmr, &arr);
+        }
+
+        // a candidate the grammar rejects carries no probability, whatever the target thinks
+        auto p_raw = [&](size_t k) {
+            return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
+        };
+
+        // masking drops probability mass, so rescale what is left or the residual is over-weighted
+        float p_sum = 0.0f;
+        if (masked) {
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                p_sum += p_raw(k);
+            }
+        }
+
+        const float p_norm = masked && p_sum > 0.0f ? 1.0f/p_sum : 1.0f;
+
+        auto p_of = [&](size_t k) {
+            return p_raw(k)*p_norm;
+        };
+
+        // q_x is never 0 for a token the draft produced, but guard the divide
+        const float q_x = prob_of(q.data(), q.size(), draft[i]);
+
+        float p_x = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            if (cur_p->data[k].id == draft[i]) {
+                p_x = p_of(k);
+                break;
+            }
+        }
+
+        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // rejected: tokens outside q's support keep all of p
+        residual.clear();
+        float sum = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            if (r > 0.0f) {
+                residual.push_back({ cur_p->data[k].id, 0.0f, r });
+                sum += r;
+            }
+        }
+
+        llama_token id = id_tgt;
+        if (sum > 0.0f) {
+            float u = uni(gsmpl->rng) * sum;
+            id = residual.back().id;
+            for (const auto & e : residual) {
+                u -= e.p;
+                if (u <= 0.0f) {
+                    id = e.id;
+                    break;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        break;
+    }
+
+    if (bonus && i == draft.size()) { // [la-s0b]
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    if (acl_clone != nullptr) {
+        if (bonus) {
+            spec_acclog_rejection(acl_clone, ctx, idxs, draft, draft_q, result.size() - 1);
+        }
+        common_sampler_free(acl_clone);
     }
 
     return result;

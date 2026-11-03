@@ -3,6 +3,7 @@
 #include "llama-model.h"
 #include "llama-graph.h"
 #include "llama-model-loader.h"
+#include "ggml-a7.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
@@ -2382,6 +2383,12 @@ struct llama_model_qwen35 : public llama_model_base {
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
+    // A7 P1: the weights of the ffn half of every trunk layer, named by GGML_OP_A7_GDN_FFN (ggml_a7_gdn_ffn); filled at the end of
+    // load_arch_tensors, never resized afterwards, so the addresses stay valid for the life of the model
+    std::vector<ggml_a7_ffn_layer> a7_ffn;
+    // A7 P2: the same for the attn half (GGML_OP_A7_GDN_ATTN, ggml_a7_gdn_attn)
+    std::vector<ggml_a7_attn_layer> a7_attn;
+
     class llm_graph_input_qsa;
     class llm_graph_input_qsa_blk;
 
@@ -2413,6 +2420,15 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         ggml_tensor * build_layer_attn(
+              llm_graph_input_attn_kv * inp_attn,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        // [mtp-kvonly] the cache writes of build_layer_attn only: raw indexer keys, pooled block keys, attention K/V
+        void build_layer_kv_only(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,

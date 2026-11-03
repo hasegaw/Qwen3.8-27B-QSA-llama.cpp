@@ -328,6 +328,16 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+    // [ghost-s0] measurement only: backend of split i, and queue the graphs of every split of `backend` again
+    // (no input copies, no events; returns the number of splits queued, -1 on failure)
+    GGML_API ggml_backend_t       ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int i);
+    GGML_API int                  ggml_backend_sched_ghost_recompute(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // [ghost-s0b] ggml_backend_sched_synchronize without waiting for `backend`
+    GGML_API void                 ggml_backend_sched_synchronize_except(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // [la-s0] compute the splits [s0, s1) of the allocated graph (the caller computes the rest later, with nothing in between)
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_range_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int s0, int s1);
+    // [reserve-heal] number of fallback re-reserves done by ggml_backend_sched_alloc_graph (custom tree)
+    GGML_API int                  ggml_backend_sched_get_n_fallback_reserve(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);

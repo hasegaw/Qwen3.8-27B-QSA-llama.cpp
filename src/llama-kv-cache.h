@@ -13,6 +13,13 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// [pp-plan-ahead] thread-local number of tokens the next llama_kv_cache_context graph build counts on top of the used cells
+// (the scheduler plan-ahead builds one graph sized for the last ubatch of a decode call); 0 = off
+void     llama_kv_plan_extra_set(uint32_t n);
+uint32_t llama_kv_plan_extra_get();
+uint32_t llama_kv_plan_real_get(); // the last n_kv a graph build used with no plan (0 = none yet)
+uint32_t llama_kv_plan_eff_take(); // the last planned n_kv, then cleared
+
 //
 // llama_kv_cache
 //
@@ -183,7 +190,7 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv(const slot_info & sinfo, uint32_t extra = 0) const; // [pp-plan-ahead] extra: planned future cells
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -475,4 +482,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // [pp-plan-ahead] n_kv with the planned extra cells (llama_kv_plan_extra_get()); the member n_kv when no plan is active
+    uint32_t n_kv_eff() const;
 };

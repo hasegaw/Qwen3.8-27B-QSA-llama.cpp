@@ -1245,17 +1245,66 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+// [pp-plan-ahead] see llama_kv_plan_extra_set() in llama-kv-cache.h
+static thread_local uint32_t kv_plan_extra = 0;
+
+void llama_kv_plan_extra_set(uint32_t n) {
+    kv_plan_extra = n;
+}
+
+static thread_local uint32_t kv_plan_real = 0; // n_kv_eff() with no plan: the last real n_kv a graph build used
+static thread_local uint32_t kv_plan_eff  = 0; // n_kv_eff() with a plan: the last planned n_kv
+
+uint32_t llama_kv_plan_real_get() {
+    return kv_plan_real;
+}
+
+uint32_t llama_kv_plan_eff_take() {
+    const uint32_t v = kv_plan_eff;
+    kv_plan_eff = 0;
+    return v;
+}
+
+uint32_t llama_kv_plan_extra_get() {
+    return kv_plan_extra;
+}
+
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t extra) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // [v4bits] LLAMA_KV_PAD=N (pentacoxian v4): a coarser step keeps graphs valid for longer
+    static const uint32_t n_pad_env = [] {
+        const char * env = getenv("LLAMA_KV_PAD");
+        return env ? (uint32_t) std::max(0, atoi(env)) : 0u;
+    }();
+    // [v4bits] LLAMA_KV_PAD_GEO=k (custom, 2026-10-02): for prompt ubatches (>= 64 tokens) only, the step is the
+    // largest power of two <= the used cells, divided by 2^k (never below the step above). n_kv then takes O(2^k) values
+    // per doubling of the prompt instead of one per 256 cells, so the scheduler re-reserves (+ syncs all GPUs) a few
+    // times per prompt instead of every ubatch; the cost is up to 1/2^k more masked cells in the n_kv-sized tensors.
+    // Decode keeps the fine step. No upstream equivalent found (gh search 2026-10-02).
+    static const int pad_geo = [] {
+        const char * env = getenv("LLAMA_KV_PAD_GEO");
+        return env ? atoi(env) : -1;
+    }();
+    uint32_t n_pad_cur = std::max({n_pad, 256u, n_pad_env});
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        // [pp-plan-ahead] count the planned future cells as used (extra = 0: the used cells, as before)
+        const uint32_t used = std::min<uint32_t>(cells.size(), cells.used_max_p1() + extra);
+
+        uint32_t step = n_pad_cur;
+        if (pad_geo >= 0 && sinfo.size() >= 64) { // [v4bits]
+            uint32_t p2 = 1;
+            while (p2 <= used / 2) { // [pp-plan-ahead]
+                p2 *= 2;
+            }
+            step = std::max(step, p2 >> std::min(pad_geo, 16));
+        }
+        result = std::max(std::min(cells.size(), std::max(step, GGML_PAD(used, step))), result); // [pp-plan-ahead]
     }
 
     return result;
@@ -2738,8 +2787,21 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     return ubatches[i_cur];
 }
 
-uint32_t llama_kv_cache_context::get_n_kv() const {
+// [pp-plan-ahead] the graph builders read n_kv through here: with a plan active, the n_kv of the last ubatch of the decode call
+uint32_t llama_kv_cache_context::n_kv_eff() const {
+    const uint32_t extra = llama_kv_plan_extra_get();
+    if (extra != 0 && !sinfos.empty() && i_cur < sinfos.size()) {
+        kv_plan_eff = kv->get_n_kv(sinfos[i_cur], extra); // the plan graph's n_kv, read back by plan_reserve
+        return kv_plan_eff;
+    }
+    if (extra == 0) {
+        kv_plan_real = n_kv; // the real n_kv of the graph just built; attention and indexer contexts agree
+    }
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv() const {
+    return n_kv_eff(); // [pp-plan-ahead]
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
@@ -2751,11 +2813,11 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k(ctx, il, n_kv_eff(), sinfos[i_cur]); // [pp-plan-ahead]
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, n_kv_eff(), sinfos[i_cur]); // [pp-plan-ahead]
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

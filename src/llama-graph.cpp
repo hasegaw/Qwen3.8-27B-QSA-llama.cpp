@@ -1335,6 +1335,8 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
     t_argmax      = nullptr;
+    t_topk_ids    = nullptr; // [gpu-topk]
+    t_topk_vals   = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -3693,6 +3695,23 @@ ggml_tensor * llm_graph_context::build_rs(
                     get_state_rows);
 }
 
+void llm_graph_context::build_rs_zero(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    const auto * kv_state = inp->mctx;
+
+    GGML_ASSERT(kv_state->get_n_rs() == (uint32_t) n_seqs);
+
+    const int32_t rs_zero = kv_state->get_rs_z();
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+
+    // same view and in-place clear as build_rs (a no-op when the view is zero-sized)
+    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+}
+
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
     llm_graph_input_rs * inp,
     const llama_ubatch & ubatch,
@@ -3920,6 +3939,36 @@ bool llama_gpu_argmax_enabled() {
     return enabled;
 }
 
+// [gpu-topk] env read once (patch-mt-gputopk.py); WARN lines because INFO does not reach server.log
+int32_t llama_gpu_topk_k(bool mtp_ctx) {
+    static const int32_t k = [] {
+        const char * env = getenv("LLAMA_GPU_TOPK");
+        const int v = env ? atoi(env) : 0;
+        if (v == 0) {
+            return 0;
+        }
+        if (v < 0 || v > 256) {
+            LLAMA_LOG_WARN("[gpu-topk] LLAMA_GPU_TOPK=%s is outside 1..256: off\n", env);
+            return 0;
+        }
+        if (!llama_gpu_argmax_enabled()) {
+            LLAMA_LOG_WARN("[gpu-topk] LLAMA_GPU_TOPK=%d ignored: it needs LLAMA_GPU_ARGMAX=1\n", v);
+            return 0;
+        }
+        return v;
+    }();
+    static const bool with_mtp = [] {
+        const char * env = getenv("LLAMA_GPU_TOPK_MTP");
+        const bool on = !(env && atoi(env) == 0);
+        if (k > 0) {
+            LLAMA_LOG_WARN("[gpu-topk] LLAMA_GPU_TOPK=%d: device top-%d of every logits row (single-device head), MTP draft contexts %s\n",
+                k, k, on ? "included" : "excluded (LLAMA_GPU_TOPK_MTP=0)");
+        }
+        return on;
+    }();
+    return mtp_ctx && !with_mtp ? 0 : k;
+}
+
 void llm_graph_context::build_argmax() const {
     if (!cparams.gpu_argmax || !samplers.empty() || !res->t_logits ||
             res->t_logits->type != GGML_TYPE_F32 || !ggml_is_matrix(res->t_logits)) {
@@ -3939,6 +3988,23 @@ void llm_graph_context::build_argmax() const {
         am = ggml_cast(ctx0, ggml_reshape_1d(ctx0, best, n_rows), GGML_TYPE_I32);
     } else {
         am = ggml_argmax(ctx0, res->t_logits);
+
+        // [gpu-topk] LLAMA_GPU_TOPK=K: the K largest logits of every row (ids unordered, GGML_OP_TOP_K) and their exact values (get_rows
+        //     from the [1, n_vocab, n_rows] view, as topk-moe gathers its weights); the CPU sampler takes its top-k candidates from them
+        const int64_t k_topk = cparams.gpu_topk;
+        ggml_tensor * lg = res->t_logits;
+        if (k_topk > 0 && k_topk < lg->ne[0] && ggml_is_contiguous(lg)) {
+            ggml_tensor * t_ids  = ggml_top_k(ctx0, lg, (int) k_topk);
+            ggml_tensor * t_vals = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, lg, 1, lg->ne[0], lg->ne[1]), t_ids);
+            ggml_set_name(t_ids,  "result_topk_ids");
+            ggml_set_name(t_vals, "result_topk_vals");
+            ggml_set_output(t_ids);
+            ggml_set_output(t_vals);
+            ggml_build_forward_expand(gf, t_ids);
+            ggml_build_forward_expand(gf, t_vals);
+            res->t_topk_ids  = t_ids;
+            res->t_topk_vals = t_vals;
+        }
     }
     ggml_set_name(am, "result_argmax");
     ggml_set_output(am);

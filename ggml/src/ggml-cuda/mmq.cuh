@@ -959,7 +959,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int32_t * __restrict__ tile_start) { // [mmq-moe-pack] tile_start: nullptr = original grid
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -989,6 +989,64 @@ static __global__ void mul_mat_q(
         ids_dst_shared[j] = j;
     }
     __syncthreads();
+
+    // [mmq-moe-pack] packed MoE grid: blockIdx.y indexes the used column tiles of all experts (tile_start = exclusive prefix sum of the
+    // per-expert tile counts, from mmq_moe_tile_start), so no block is launched for a tile past an expert's last row
+    if (tile_start) {
+        const int n_experts = nchannels_y.z;
+        const int g = blockIdx.y;
+        if (g >= tile_start[n_experts]) {
+            return;
+        }
+        int lo = 0;
+        int hi = n_experts;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) / 2;
+            if (tile_start[mid] <= g) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        const int zt = lo;
+        const int jt = g - tile_start[zt];
+        const int it = blockIdx.x;
+        const int wt = blockIdx.z;
+
+        const int col_low  = expert_bounds[zt + 0];
+        const int col_diff = expert_bounds[zt + 1] - col_low;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+            if (j0 + nwarps*warp_size > J && j >= J) {
+                break;
+            }
+
+            ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+        }
+        __syncthreads();
+
+        const int offset_y   = (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        const int offset_dst = it*I;
+        const float * y_scale_tile = nullptr;
+        if constexpr (type == GGML_TYPE_NVFP4) {
+            y_scale_tile = y_scale ? y_scale + col_low + jt*J : nullptr;
+        }
+
+        const int tile_x_max_i = nrows_x  - it*I - 1;
+        const int tile_y_max_j = col_diff - jt*J - 1;
+
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, J, fallback, fixup>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+             stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+        return;
+    }
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
@@ -1392,6 +1450,39 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// [mmq-moe-pack] GGML_CUDA_MMQ_MOE_PACK=1, see patch-mt-moepack.py
+static bool ggml_cuda_mmq_moe_pack() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MMQ_MOE_PACK");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// [mmq-moe-pack] one block of 1024 threads: tile_start[e] = sum over e' < e of ceil(count_e'/J), tile_start[n_experts] = total
+static __global__ void mmq_moe_tile_start(const int32_t * __restrict__ expert_bounds, const int n_experts, const int J, int32_t * __restrict__ tile_start) {
+    __shared__ int s[1024];
+    const int e = threadIdx.x;
+    int v = 0;
+    if (e < n_experts) {
+        v = (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J;
+    }
+    s[e] = v;
+    __syncthreads();
+    for (int off = 1; off < 1024; off *= 2) {
+        const int t = e >= off ? s[e - off] : 0;
+        __syncthreads();
+        s[e] += t;
+        __syncthreads();
+    }
+    if (e < n_experts) {
+        tile_start[e + 1] = s[e];
+    }
+    if (e == 0) {
+        tile_start[0] = 0;
+    }
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1426,13 +1517,33 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    // [mmq-moe-pack] launch only the used column tiles (bound: one partial tile per expert plus the full ones)
+    if (args.ids_dst && ggml_cuda_mmq_moe_pack() && args.nchannels_y <= 1024 && args.nsamples_y == 1) {
+        const int n_experts = args.nchannels_y;
+        const int64_t ntiles_all  = int64_t(ntx)*n_experts;
+        const int64_t ntiles_used = (args.ncols_dst + config.J - 1)/config.J + n_experts;
+        const int64_t ntiles_max  = ntiles_used < ntiles_all ? ntiles_used : ntiles_all;
+        if (ntiles_max <= 65535) {
+            ggml_cuda_pool_alloc<int32_t> tile_start(ctx.pool(id), n_experts + 1);
+            mmq_moe_tile_start<<<1, 1024, 0, stream>>>(args.expert_bounds, n_experts, config.J, tile_start.get());
+            const dim3 block_nums_pack(nty, ntiles_max, 1);
+            mul_mat_q<type, J, fallback><<<block_nums_pack, block_dims, nbytes_shared, stream>>>
+            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+             blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+             channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+             sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+             ntx_fd, tile_start.get());
+            return;
+        }
+    }
+
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, nullptr);
         return;
     }
 
@@ -1461,7 +1572,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, nullptr);
 
     if (!fixup_needed) {
         return;

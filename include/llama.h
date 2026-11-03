@@ -1055,6 +1055,11 @@ extern "C" {
     // available. Reading it does not copy the logits to the host.
     LLAMA_API llama_token llama_get_argmax_ith(struct llama_context * ctx, int32_t i);
 
+    // [gpu-topk] The K largest logits of output i and their token ids, computed on the device (LLAMA_GPU_TOPK=K with
+    // LLAMA_GPU_ARGMAX=1), in no particular order. Returns K and sets *ids / *vals (valid until the next decode), or 0 (and NULL)
+    // when not available. Reading them does not copy the logits to the host.
+    LLAMA_API int32_t llama_get_topk_ith(struct llama_context * ctx, int32_t i, const llama_token ** ids, const float ** vals);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

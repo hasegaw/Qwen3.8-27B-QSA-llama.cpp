@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
+#include "gdn-chunk.cuh" // [gdn-chunk]
 
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -308,6 +309,53 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (cache != nullptr) {
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
+    }
+
+    // [gdn-chunk] env GGML_CUDA_GDN_CHUNK=1 on Volta (gdn-chunk.cu): tokens [0, n_c) through the chunked tensor-core kernel into a
+    // temporary state, the remaining n_tokens - n_c >= K tokens through the recurrent kernel from that state with the original
+    // state output / slot stride / K, so attention rows and snapshot slots land where the unsplit run writes them
+    {
+        const int64_t n_c = ggml_cuda_gdn_chunk_tokens(ctx.device, kda, S_v, neq0, H, neqk1, n_tokens, n_seqs, K);
+        if (n_c > 0) {
+            ggml_cuda_pool_alloc<float> s_mid(ctx.pool(), S_v * S_v * H);
+
+            ggml_cuda_gdn_chunk_args ca;
+            ca.q                = q_d;
+            ca.k                = k_d;
+            ca.v                = v_d;
+            ca.g                = g_d;
+            ca.beta             = b_d;
+            ca.state            = s_d;
+            ca.state_rows       = state_rows;
+            ca.state_row_stride = state_row_stride;
+            ca.dst              = dst_d;
+            ca.state_out        = s_mid.get();
+            ca.H                = H;
+            ca.H_k              = neqk1;
+            ca.n_tokens         = n_c;
+            ca.sq1              = sq1;
+            ca.sq2              = sq2;
+            ca.sv1              = sv1;
+            ca.sv2              = sv2;
+            ca.sb1              = sb1;
+            ca.sb2              = sb2;
+            ca.scale            = scale;
+            ggml_cuda_gdn_chunk_launch(ctx.device, ca, n_tokens, K, stream);
+
+            const int64_t n_r = n_tokens - n_c; // >= K
+            if (keep_rs) {
+                launch_gated_delta_net<false, true>(q_d + n_c * sq2, k_d + n_c * sq2, v_d + n_c * sv2, g_d + n_c * sb2,
+                    b_d + n_c * sb2, s_mid.get(), dst_d + n_c * S_v * H, state_d,
+                    S_v, H, n_r, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, nullptr, 0, stream);
+            } else {
+                launch_gated_delta_net<false, false>(q_d + n_c * sq2, k_d + n_c * sq2, v_d + n_c * sv2, g_d + n_c * sb2,
+                    b_d + n_c * sb2, s_mid.get(), dst_d + n_c * S_v * H, state_d,
+                    S_v, H, n_r, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, nullptr, 0, stream);
+            }
+            return;
+        }
     }
 
     if (kda) {
