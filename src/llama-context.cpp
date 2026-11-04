@@ -1467,7 +1467,18 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
 // [mtp-kvonly] see llama_set_mtp_kv_only (llama-ext.h)
 void llama_context::set_mtp_kv_only(bool value) {
-    cparams.mtp_kv_only = value && model.arch == LLM_ARCH_QWEN4EXP;
+    cparams.mtp_kv_only = value && (model.arch == LLM_ARCH_QWEN4EXP || model.arch == LLM_ARCH_QWEN35);
+}
+
+void llama_context::set_mtp_input_embeddings(const float * data, uint32_t n_tokens) {
+    GGML_ASSERT(cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
+    GGML_ASSERT(model.arch == LLM_ARCH_QWEN35);
+    if (data) {
+        cparams.mtp_input_embeddings = std::make_shared<const std::vector<float>>(
+                data, data + (size_t) n_tokens*model.hparams.n_embd_inp());
+    } else {
+        cparams.mtp_input_embeddings.reset();
+    }
 }
 
 // [pp-plan-hint] see llama_set_pp_plan_hint (llama-ext.h)
@@ -1512,6 +1523,14 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+void llama_context::set_qsa_enabled(bool value) {
+    if (cparams.qsa_enabled != value) {
+        cparams.qsa_enabled = value;
+        sched_need_reserve = true;
+        LLAMA_LOG_INFO("QSA27B mode: %s\n", value ? "sparse text" : "dense multimodal");
+    }
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -5165,6 +5184,8 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
+void llama_set_qsa_enabled(llama_context * ctx, bool enabled) { ctx->set_qsa_enabled(enabled); }
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     llama_mtp_async_guard(ctx, __func__); // [mtp-async]
     ctx->set_causal_attn(causal_attn);
@@ -5245,6 +5266,11 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 void llama_set_mtp_kv_only(llama_context * ctx, bool value) {
     llama_mtp_async_guard(ctx, __func__); // [mtp-async] // [mtp-kvonly]
     ctx->set_mtp_kv_only(value);
+}
+
+void llama_set_mtp_input_embeddings(llama_context * ctx, const float * data, uint32_t n_tokens) {
+    llama_mtp_async_guard(ctx, __func__);
+    ctx->set_mtp_input_embeddings(data, n_tokens);
 }
 
 void llama_decode_kv_only_async(llama_context * ctx, llama_batch batch) {

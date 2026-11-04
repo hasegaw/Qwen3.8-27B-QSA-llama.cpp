@@ -28,7 +28,7 @@ bool ggml_cuda_qsa_attn_supported(const ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * m = dst->src[3];
     const ggml_tensor * ids = dst->src[5];
-    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_Q8_0 || v->type != GGML_TYPE_Q8_0 || !m || m->type != GGML_TYPE_F16) {
+    if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_F16) || v->type != k->type || !m || m->type != GGML_TYPE_F16) {
         return false;
     }
     if (q->ne[0] != QSA_ATTN_D || k->ne[0] != QSA_ATTN_D || v->ne[0] != QSA_ATTN_D || ggml_get_op_params_i32(dst, 6) != QSA_ATTN_R) {
@@ -70,6 +70,11 @@ void ggml_cuda_qsa_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int n_sm    = ggml_cuda_info().devices[ctx.device].nsm;
     const int blocks0 = n_tok * (int) k->ne[1];
     int n_split = std::max(1, std::min(64, (n_sm*8 + blocks0 - 1) / blocks0));
+    // An exhaustive list is used by dense MTP attention. Bound the work and
+    // shared memory per CTA there; the usual ~512-block QSA lists are unchanged.
+    if (k->type == GGML_TYPE_F16 && n_wblk > 1024) {
+        n_split = std::max(n_split, std::min(512, (n_wblk + 127)/128));
+    }
     n_split = std::min(n_split, n_wblk);
 
     ggml_cuda_pool_alloc<float>  part_acc(ctx.pool());
@@ -104,9 +109,10 @@ void ggml_cuda_qsa_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         n_head, gqa, n_wblk, n_split, q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], \
         m->nb[3], ids->nb[1], scale
 #define QSA_LAUNCH(HPW, NGRP) \
-    if (use_dp4a) { qsa_attn_kernel_dp4a<HPW, NGRP><<<grid, block, smem, stream>>>(QSA_ARGS); } \
+    if (k->type == GGML_TYPE_F16) { qsa_attn_kernel<HPW, NGRP, true><<<grid, block, smem, stream>>>(QSA_ARGS); } \
+    else if (use_dp4a) { qsa_attn_kernel_dp4a<HPW, NGRP><<<grid, block, smem, stream>>>(QSA_ARGS); } \
     else          { qsa_attn_kernel<HPW, NGRP><<<grid, block, smem, stream>>>(QSA_ARGS); }
-    if (use_hpw6 && use_dp4a && gqa == 12) {
+    if (k->type == GGML_TYPE_Q8_0 && use_hpw6 && use_dp4a && gqa == 12) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed)) {
             GGML_LOG_WARN("[qsa-hpw6] selected dp4a<6,2>: tokens=%d heads=%d kv=%lld splits=%d threads=64 smem=%zu\n",

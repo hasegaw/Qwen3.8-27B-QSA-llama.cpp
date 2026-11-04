@@ -883,3 +883,31 @@ class DSparkModel(DFlashModel):
                 raise ValueError("d2t contains duplicate target ids")
             logger.info(f"{'d2t,':<30} --> I64, shape = {{{data.size}}}")
             self.gguf_writer.add_tensor("d2t", data, raw_dtype=gguf.GGMLQuantizationType.I64)
+
+
+@ModelBase.register("QSAQwen3_5ForConditionalGeneration")
+class QSAQwen35Model(Qwen3_5TextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        cfg = json.loads((self.dir_model / "config.json").read_text())
+        q = cfg["qsa"]
+        self.gguf_writer.add_indexer_head_count(q["indexer_heads"])
+        self.gguf_writer.add_indexer_key_length(q["indexer_head_dim"])
+        self.gguf_writer.add_indexer_top_k(q["budget"])
+        kinds = cfg["text_config"]["layer_types"]
+        ratios = [q["block_size"] if kind == "full_attention" else 0 for kind in kinds]
+        self.gguf_writer.add_attention_compress_ratios(ratios + [0]*(self.block_count - len(ratios)))
+
+    def modify_tensors(self, tensor, name, bid):
+        if "._qsa_indexer." in name:
+            suffix = name.split("._qsa_indexer.")[1]
+            mapped = {"q_proj.weight": "q_proj.weight", "k_proj.weight": "k_proj.weight", "q_norm": "q_norm.weight", "k_norm": "k_norm.pre_weight", "k_block_norm": "k_norm.weight"}[suffix]
+            if suffix.endswith("norm"): tensor = tensor.float() + 1
+            yield f"blk.{bid}.indexer.{mapped}", tensor
+        else:
+            yield from super().modify_tensors(tensor, name, bid)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if ".indexer." in new_name: return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common.cuh"
+#include <type_traits>
 
 #define QSA_ATTN_D     256
 #define QSA_ATTN_R     4
@@ -37,7 +38,26 @@ static __device__ __forceinline__ void qsa_dequant(const qsa_raw & r, const int 
     }
 }
 
-template <int HPW, int NGRP>
+struct qsa_raw_f16 {
+    uint4 words[QSA_ATTN_R];
+};
+
+static __device__ __forceinline__ void qsa_load_raw(const char * base, const size_t nb_cell, const int lane, qsa_raw_f16 & r) {
+#pragma unroll
+    for (int c = 0; c < QSA_ATTN_R; ++c) {
+        r.words[c] = *(const uint4 *) (base + c*nb_cell + lane*qsa_dpl*sizeof(half));
+    }
+}
+
+static __device__ __forceinline__ void qsa_dequant(const qsa_raw_f16 & r, const int c, float (&x)[qsa_dpl]) {
+    const half * values = (const half *) &r.words[c];
+#pragma unroll
+    for (int d = 0; d < qsa_dpl; ++d) {
+        x[d] = __half2float(values[d]);
+    }
+}
+
+template <int HPW, int NGRP, bool CACHE_F16 = false>
 __launch_bounds__(NGRP*WARP_SIZE)
 static __global__ void qsa_attn_kernel(
         const char * __restrict__ q, const char * __restrict__ k, const char * __restrict__ v,
@@ -123,7 +143,7 @@ static __global__ void qsa_attn_kernel(
         const float mv = s_mask[(j - j0)*QSA_ATTN_R + my_c];
         // K and V reads both issued before the math
         const int64_t cell0 = (int64_t) s_ids[j - j0] * QSA_ATTN_R;
-        qsa_raw kr, vr;
+        typename std::conditional<CACHE_F16, qsa_raw_f16, qsa_raw>::type kr, vr;
         qsa_load_raw(k + cell0*nbk2 + h_kv*nbk1, nbk2, lane, kr);
         qsa_load_raw(v + cell0*nbv2 + h_kv*nbv1, nbv2, lane, vr);
 

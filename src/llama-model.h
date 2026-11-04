@@ -571,6 +571,7 @@ struct llama_layer {
     struct ggml_tensor * index_k_proj = nullptr;
     struct ggml_tensor * index_q_norm = nullptr;
     struct ggml_tensor * index_k_norm = nullptr;
+    struct ggml_tensor * index_k_pre_norm = nullptr;
 
     struct ggml_tensor * hc_attn_norm   = nullptr;
     struct ggml_tensor * hc_attn_down   = nullptr;

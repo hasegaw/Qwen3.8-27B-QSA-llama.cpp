@@ -119,6 +119,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_mtp_kv_only(bool value); // [mtp-kvonly]
+    void set_mtp_input_embeddings(const float * data, uint32_t n_tokens);
     void set_pp_plan_hint(uint32_t n_tokens); // [pp-plan-hint]
     void set_embeddings_nextn_lag(bool value); // [mtp-lag]
     void    decode_kv_only_async(const llama_batch & batch); // [mtp-async]
@@ -129,6 +130,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+    void set_qsa_enabled(bool value);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

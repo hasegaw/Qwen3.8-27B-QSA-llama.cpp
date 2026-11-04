@@ -756,6 +756,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
+    if (!batch.token) {
+        udata->batch_indices = idxs;
+    }
+
     udata->token     .resize(n_tokens);
     udata->embd      .resize(n_embd_all);
     udata->pos       .resize(n_pos_all);

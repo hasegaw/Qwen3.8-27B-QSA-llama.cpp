@@ -99,6 +99,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // raw indexer keys, pooled block keys) - no attention, FFN, head or outputs. For catch-up rows that request nothing.
 LLAMA_API void llama_set_mtp_kv_only(struct llama_context * ctx, bool value);
 
+// Qwen35 MTP: separate image token embeddings from the hidden rows in batch.embd.
+// The input is copied and may be released by the caller. Clear after the decode.
+LLAMA_API void llama_set_mtp_input_embeddings(struct llama_context * ctx, const float * data, uint32_t n_tokens);
+
 // [la-s0] LLAMA_LOOKAHEAD: queue the GPU0 part of the next verify window while the current one finishes on GPU1 (two GPUs, pipeline
 // parallel); then either resume it with the same batch (only its remaining part runs) or discard it. 0 = queued, 1 = not queued
 LLAMA_API int32_t llama_decode_lookahead(struct llama_context * ctx, struct llama_batch batch);

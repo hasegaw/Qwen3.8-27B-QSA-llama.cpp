@@ -160,6 +160,8 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
+    std::shared_ptr<const std::vector<float>> input_embeddings;
+
     const int64_t n_embd = 0;
 };
 
@@ -910,6 +912,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.mtp_kv_only             == other.cparams.mtp_kv_only             && // [mtp-kvonly]
+            cparams.qsa_enabled             == other.cparams.qsa_enabled             &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&

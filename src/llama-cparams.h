@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <memory>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -39,10 +40,12 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool mtp_kv_only = false;     // [mtp-kvonly] MTP prompt catch-up: build only the MTP block's cache writes
+    std::shared_ptr<const std::vector<float>> mtp_input_embeddings;
     bool gpu_argmax;              // LLAMA_GPU_ARGMAX
     uint32_t argmax_n_dev = 1;    // tensor split: logits are split by vocab over this many devices, see ggml_argmax_split
     uint32_t gpu_topk     = 0;    // [gpu-topk] LLAMA_GPU_TOPK: K of the device top-K of the logits rows (0 = off)
     bool causal_attn;
+    bool qsa_enabled = true;
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;

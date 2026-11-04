@@ -299,6 +299,7 @@ struct server_slot {
     int id;
 
     llama_context * ctx_tgt = nullptr;
+    int qsa_mode = -1;
     llama_context * ctx_dft = nullptr;
 
     common_memory mem;
@@ -1805,6 +1806,21 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        char qsa_heads[32];
+        if (llama_model_meta_val_str(model_tgt, "qwen35.attention.indexer.head_count", qsa_heads, sizeof(qsa_heads)) > 0) {
+            if (params_base.n_parallel != 1) { send_error(task, "QSA27B requires one slot", ERROR_TYPE_INVALID_REQUEST); return false; }
+            bool media = false;
+            for (size_t i = 0; i < task.tokens.size(); ++i) { media |= task.tokens[i] == LLAMA_TOKEN_NULL; }
+            const bool sparse = !getenv("LLAMA_QSA_DENSE");
+            if (slot.qsa_mode != int(sparse)) {
+                slot.prompt_clear();
+                llama_memory_clear(llama_get_memory(slot.ctx_tgt), true);
+                if (slot.ctx_dft) { llama_memory_clear(llama_get_memory(slot.ctx_dft), true); }
+                slot.qsa_mode = int(sparse);
+            }
+            llama_set_qsa_enabled(slot.ctx_tgt, sparse);
+            SRV_INF("QSA27B route: %s\n", sparse ? (media ? "sparse multimodal" : "sparse text") : "dense baseline");
+        }
         la_level_reload(); // [la-ctl]
         // process per-request lora adapters
         if (!task.params.lora.empty()) {

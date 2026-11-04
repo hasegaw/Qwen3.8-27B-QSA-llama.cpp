@@ -106,7 +106,18 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ubatch->embd);
         GGML_ASSERT(n_embd == embd->ne[0]);
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        if (input_embeddings) {
+            GGML_ASSERT(ubatch->data && ubatch->data->batch_indices.size() == (size_t) n_tokens);
+            std::vector<float> rows(n_tokens*n_embd);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const int64_t row = ubatch->data->batch_indices[i];
+                GGML_ASSERT(row >= 0 && (row + 1)*n_embd <= (int64_t) input_embeddings->size());
+                std::copy_n(input_embeddings->data() + row*n_embd, n_embd, rows.data() + i*n_embd);
+            }
+            ggml_backend_tensor_set(embd, rows.data(), 0, rows.size()*sizeof(float));
+        } else {
+            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        }
     }
 
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
@@ -120,6 +131,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
+    input_embeddings = params.cparams.mtp_input_embeddings;
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);

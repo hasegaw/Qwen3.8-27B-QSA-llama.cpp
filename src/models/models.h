@@ -101,6 +101,48 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int                  il);
 };
 
+class llm_graph_input_qsa_blk;
+
+struct llm_build_qsa_base : public llm_build_delta_net_base {
+    const llama_model & model;
+    llm_build_qsa_base(const llama_model & model, const llm_graph_params & params) :
+        llm_build_delta_net_base(params), model(model) {}
+    bool qsa_block_fast(const llama_memory_hybrid_idx_context *, uint32_t) const;
+        // pooled block-key cache (see llama_memory_hybrid_idx::get_mem_blk): inputs per ratio,
+        // the incremental update, and the fixed-cost decode selection + attention over whole blocks
+        std::map<uint32_t, llm_graph_input_qsa_blk *> qsa_blk_inps;
+
+        llm_graph_input_qsa_blk * get_qsa_blk_input(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                       uint32_t   ratio,
+                           bool   fast);
+
+        ggml_tensor * build_qsa_blk_update(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_qsa_blk * inp,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_qsa_blk_select(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_qsa_blk * inp,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_attn_qsa_blk(
+        llm_graph_input_attn_kv * inp,
+        llm_graph_input_qsa_blk * blk_inp,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                    ggml_tensor * top_blk,
+                          float   kq_scale,
+                            int   il);
+
+};
+
 struct llm_build_rwkv6_base : public llm_graph_context {
     const llama_model & model;
 
@@ -2339,9 +2381,11 @@ struct llama_model_qwen35 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    struct graph : public llm_build_delta_net_base {
+    struct graph : public llm_build_qsa_base {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
+        llm_graph_input_i * qsa_input = nullptr;
+        ggml_tensor * build_qsa_mask(llm_graph_input_attn_kv *, ggml_tensor *, ggml_tensor *, int *, int);
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
@@ -2390,18 +2434,17 @@ struct llama_model_qwen4exp : public llama_model_base {
     std::vector<ggml_a7_attn_layer> a7_attn;
 
     class llm_graph_input_qsa;
-    class llm_graph_input_qsa_blk;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    struct graph : public llm_build_delta_net_base {
+    struct graph : public llm_build_qsa_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
         // tag-dispatched ctor for graph_mtp: binds the members without building the trunk
         struct no_build_t {};
         graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
-            llm_build_delta_net_base(params), model(model) {}
+            llm_build_qsa_base(model, params), model(model) {}
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
@@ -2449,39 +2492,6 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
-
-        // pooled block-key cache (see llama_memory_hybrid_idx::get_mem_blk): inputs per ratio,
-        // the incremental update, and the fixed-cost decode selection + attention over whole blocks
-        std::map<uint32_t, llm_graph_input_qsa_blk *> qsa_blk_inps;
-
-        llm_graph_input_qsa_blk * get_qsa_blk_input(
-  const llama_memory_hybrid_idx_context * mctx_hyb,
-                       uint32_t   ratio,
-                           bool   fast);
-
-        ggml_tensor * build_qsa_blk_update(
-  const llama_memory_hybrid_idx_context * mctx_hyb,
-        llm_graph_input_qsa_blk * inp,
-                            int * sections,
-                            int   il);
-
-        ggml_tensor * build_qsa_blk_select(
-  const llama_memory_hybrid_idx_context * mctx_hyb,
-        llm_graph_input_qsa_blk * inp,
-                    ggml_tensor * cur,
-                    ggml_tensor * inp_pos,
-                            int * sections,
-                            int   il);
-
-        ggml_tensor * build_attn_qsa_blk(
-        llm_graph_input_attn_kv * inp,
-        llm_graph_input_qsa_blk * blk_inp,
-                    ggml_tensor * q_cur,
-                    ggml_tensor * k_cur,
-                    ggml_tensor * v_cur,
-                    ggml_tensor * top_blk,
-                          float   kq_scale,
-                            int   il);
 
         // device-bound owner for the fused CUDA hyper-connection kernels, chosen by build_hc_mix
         // from the layer's weights and reused by the build_hc_combine that closes the sublayer

@@ -1814,7 +1814,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return false;
         }
 
-        // TODO: how to make it work with vision tokens?
+        if (batch_in.pos[0] == 0) {
+            const llama_seq_id seq = batch_in.seq_id[0][0];
+            std::fill(pending_h[seq].begin(), pending_h[seq].end(), 0.0f);
+            def_tok.clear(); def_pos.clear(); def_embd.clear(); def_keep = -1;
+        }
+
+        if (batch_in.token == nullptr && batch_in.embd != nullptr) {
+            char arch[32] = {};
+            llama_model_meta_val_str(llama_get_model(params.ctx_dft), "general.architecture", arch, sizeof(arch));
+            if (std::strcmp(arch, "qwen35") != 0 || is_mem_shared) {
+                SPC_ERR("%s", "MTP image input is unsupported for this architecture\n");
+                return false;
+            }
+            const llama_seq_id seq = batch_in.seq_id[0][0];
+            for (int32_t i = 0; i < batch_in.n_tokens; ++i) {
+                if (batch_in.n_seq_id[i] != 1 || batch_in.seq_id[i][0] != seq) { return false; }
+            }
+            if (!flush_deferred(batch_in.pos[0])) { return false; }
+            const float * target = llama_get_embeddings_nextn(params.ctx_tgt);
+            if (!target) { return false; }
+            const size_t width = n_embd;
+            std::vector<float> hidden((size_t) batch_in.n_tokens*width);
+            std::copy_n(pending_h[seq].data(), width, hidden.data());
+            std::copy_n(target, (size_t) (batch_in.n_tokens - 1)*width, hidden.data() + width);
+            std::vector<int8_t> outputs(batch_in.n_tokens, 0);
+            llama_batch image_batch = batch_in;
+            image_batch.embd = hidden.data();
+            image_batch.logits = outputs.data();
+            llama_set_mtp_input_embeddings(params.ctx_dft, batch_in.embd, batch_in.n_tokens);
+            llama_set_mtp_kv_only(params.ctx_dft, true);
+            const int rc = llama_decode(params.ctx_dft, image_batch);
+            llama_set_mtp_kv_only(params.ctx_dft, false);
+            llama_set_mtp_input_embeddings(params.ctx_dft, nullptr, 0);
+            if (rc != 0) { return false; }
+            verify_h_rows[seq] = 1;
+            verify_h[seq].assign(target + (batch_in.n_tokens - 1)*width, target + batch_in.n_tokens*width);
+            pending_h[seq] = verify_h[seq];
+            draft_pending = false;
+            SPC_INF("MTP image cache updated: %d rows, first position %d\n", batch_in.n_tokens, batch_in.pos[0]);
+            return true;
+        }
+
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
             return true;
         }
@@ -2328,6 +2369,34 @@ after_catch_up:
                 n_tok = 0;
             }
         }
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || lag_on || async_on || chain_heads || is_mem_shared) {
+            return false;
+        }
+        const uint32_t header[] = {0x4d4d3251u, 1u, (uint32_t) n_embd};
+        data.resize(sizeof(header) + (size_t) n_embd*sizeof(float));
+        std::memcpy(data.data(), header, sizeof(header));
+        std::memcpy(data.data() + sizeof(header), pending_h[seq_id].data(), (size_t) n_embd*sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.size() != 3*sizeof(uint32_t) + (size_t) n_embd*sizeof(float)) {
+            return;
+        }
+        uint32_t header[3];
+        std::memcpy(header, data.data(), sizeof(header));
+        if (header[0] != 0x4d4d3251u || header[1] != 1 || header[2] != (uint32_t) n_embd) { return; }
+        llama_async_join_by(params.ctx_dft, __func__);
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), (size_t) n_embd*sizeof(float));
+        verify_h[seq_id] = pending_h[seq_id];
+        verify_h_rows[seq_id] = 1;
+        def_tok.clear(); def_pos.clear(); def_embd.clear(); def_keep = -1;
+        lag_tok.clear(); lag_pos.clear();
+        ahead_saved = false; ahead_out.clear(); ahead_q.clear();
+        draft_pending = false;
     }
 
     void accept_feedback(llama_seq_id seq_id, uint16_t n_accepted) override {
