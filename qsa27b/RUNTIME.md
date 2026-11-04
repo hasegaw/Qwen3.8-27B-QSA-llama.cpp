@@ -1,4 +1,4 @@
-# MM2 native runtime snapshot
+# Qwen3.8-27B QSA native runtime snapshot
 
 This archive preserves the exact running llama-server and eight shared libraries,
 plus the complete patched source. SHA256SUMS includes every regular file.
@@ -25,7 +25,7 @@ are not validated by this binary snapshot.
 
 ## Build from the included source
 
-`source/` is upstream base 6209237 plus the complete MM2 patch and deployment files.
+`source/` is upstream base 6209237 plus the complete QSA patch and deployment files.
 It is a full source snapshot; no earlier CUDA object cache or shallow git bundle
 is needed for a fresh full build. The following is a source-build recipe, not a
 claim that a fresh build will have the same binary bytes as the captured runtime.
@@ -46,9 +46,9 @@ The custom converter preserves indexers as FP32 and folds the indexer norm as
 `1 + weight`; Q8_0 is applied to eligible main-model matrices.
 
 ```sh
-python source/convert_hf_to_gguf.py /path/to/Qwen3.8-27B-QSA-MM2-BF16 \
+python source/convert_hf_to_gguf.py /path/to/Qwen3.8-27B-QSA-BF16 \
   --outtype q8_0 --outfile /path/to/new-main.gguf
-python source/convert_hf_to_gguf.py /path/to/Qwen3.8-27B-QSA-MM2-BF16 \
+python source/convert_hf_to_gguf.py /path/to/Qwen3.8-27B-QSA-BF16 \
   --mmproj --outtype f16 --outfile /path/to/new-mmproj.gguf
 ```
 
@@ -61,7 +61,7 @@ The included full patch applies once to base 6209237; do not layer an older QSA
 patch on top of it. qsa27b/validation contains the original small fixtures and
 artifact checks. Some research drivers retain their historical filesystem layout
 and must be pointed at your copied assets before use. No new 27B quality run was
-performed during publication. Captured validation summaries and the controlled
+performed during publication. Captured validation summaries and the measured
 text-throughput result are included separately from the source fixtures.
 
 Source is MIT, with upstream third-party notices preserved. GGUF model weights
