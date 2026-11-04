@@ -2,7 +2,7 @@
 
 [English](README.md) | [日本語](README.ja.md)
 
-This fork adds QSA, multimodal indexer support, MTP, and live prefix-cache reuse for Qwen3.8-27B. The engine targets Qwen3.8-27B, not Qwen3.8-FlashNext.
+This fork adds QSA, multimodal indexer support, MTP, and live prefix-cache reuse for Qwen3.8-27B.
 
 It is based on [pentaCoxian/Qwen-V100-llama.cpp](https://github.com/pentaCoxian/Qwen-V100-llama.cpp) at `6209237df53569f07429f3f79fc5354de5fe704f`.
 
@@ -17,8 +17,6 @@ Text, images, and video use native QSA with M-RoPE. MTP provides up to two draft
 ## Build and run
 
 See the [build, conversion, and runtime instructions](qsa27b/RUNTIME.md). The captured runtime uses CUDA 12.9 on two sm70 32GB GPUs. Other hardware needs a source build and appropriate memory sizing.
-
-The `mm2` strings in artifact names, checkpoint paths, and branch names are historical experiment identifiers retained for compatibility and reproducibility. They are not part of the QSA method name.
 
 ## Measured throughput and limits
 

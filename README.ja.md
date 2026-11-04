@@ -2,7 +2,7 @@
 
 [English](README.md) | [日本語](README.ja.md)
 
-このforkはQwen3.8-27B向けにQSA、マルチモーダルindexer、MTP、稼働中のprefixキャッシュ再利用を追加したものです。対象はQwen3.8-27Bであり、Qwen3.8-FlashNextではありません。
+このforkはQwen3.8-27B向けにQSA、マルチモーダルindexer、MTP、稼働中のprefixキャッシュ再利用を追加したものです
 
 基盤は[pentaCoxian/Qwen-V100-llama.cpp](https://github.com/pentaCoxian/Qwen-V100-llama.cpp)のcommit `6209237df53569f07429f3f79fc5354de5fe704f`です。
 
@@ -17,8 +17,6 @@
 ## ビルドと実行
 
 ビルド、変換、実行手順は[ランタイムガイド](qsa27b/RUNTIME.md)を参照してください。収録した実行環境はCUDA 12.9とsm70の32GB GPU 2台を使用します。それ以外のハードウェアでは、ソースからのビルドとメモリ容量に合わせた設定が必要です。
-
-成果物名、checkpoint path、branch名に残る`mm2`は、互換性と再現性のために保持した過去の実験識別子です。QSA方式の名前ではありません。
 
 ## 測定結果と限界
 

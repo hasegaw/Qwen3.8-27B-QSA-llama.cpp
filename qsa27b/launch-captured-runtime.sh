@@ -23,9 +23,9 @@ export LLAMA_KV_PAD_GEO=2
 export LLAMA_PP_REUSE_MAX_TOKENS=16
 export LLAMA_CKPT_TAIL_UBATCH=1
 exec "$qsa_root/bin/llama-server" \
-  -m "$qsa_model_dir/Qwen3.8-27B-QSA-mm2-Q8_0.gguf" \
+  -m "$qsa_model_dir/Qwen3.8-27B-QSA-Q8_0.gguf" \
   --mmproj "$qsa_model_dir/mmproj-Qwen3.8-27B-QSA-F16.gguf" \
-  --alias qwen3.8-27b-qsa,qwen3.8-27b-qsa-text,qwen3.8-27b-qsa-mm2 \
+  --alias qwen3.8-27b-qsa,qwen3.8-27b-qsa-text \
   -ngl all --device CUDA0,CUDA1 -sm layer -ts 1,1 -fa on -np 1 --fit off \
   -t 8 -tb 16 -c "${QSA_CONTEXT:-262144}" -b 2048 -ub 512 -ctk f16 -ctv f16 \
   --cache-ram 0 --ctx-checkpoints 8 --checkpoint-min-step 1024 --no-context-shift \
