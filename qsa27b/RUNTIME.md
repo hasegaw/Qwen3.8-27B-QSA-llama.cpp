@@ -15,7 +15,7 @@ QSA_MODEL_DIR=/path/to/gguf ./launch.sh
 
 Default: localhost:8091, two sm70 32GB GPUs, layer split 1:1, context 262144,
 FP16 KV, batch2048/ubatch512, one slot, MTP draft2, lag0/async0.
-QSA_HOST, QSA_PORT, QSA_CONTEXT and CUDA_HOME can be overridden.
+QSA_HOST, QSA_PORT, QSA_CONTEXT, QSA_BIN and CUDA_HOME can be overridden.
 Extra server arguments are passed through. No daemon or system configuration is changed.
 Do not run this model alongside another model that occupies the same GPUs.
 
@@ -32,6 +32,12 @@ claim that a fresh build will have the same binary bytes as the captured runtime
 
 ```sh
 CUDA_HOME=/usr/local/cuda-12.9 bash source/qsa27b/build.sh
+```
+
+To start the source-built binary with the same settings:
+
+```sh
+QSA_BIN="$PWD/source/build-qsa/bin/llama-server" QSA_MODEL_DIR=/path/to/gguf ./launch.sh
 ```
 
 For the exact validated executable, use the archived bin/ and lib/ files.

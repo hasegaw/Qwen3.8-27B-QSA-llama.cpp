@@ -2,6 +2,7 @@
 set -euo pipefail
 qsa_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 qsa_model_dir="${QSA_MODEL_DIR:-$(dirname -- "$qsa_root")}"
+qsa_bin="${QSA_BIN:-$qsa_root/bin/llama-server}"
 export LD_LIBRARY_PATH="$qsa_root/bin:$qsa_root/lib:${CUDA_HOME:-/usr/local/cuda-12.9}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LLAMA_QSA_RESERVE_BLK=1
 export LLAMA_QSA_BLK_REBUILD=1
@@ -22,7 +23,7 @@ export LLAMA_PP_PLAN_AHEAD_MAX_KV=0
 export LLAMA_KV_PAD_GEO=2
 export LLAMA_PP_REUSE_MAX_TOKENS=16
 export LLAMA_CKPT_TAIL_UBATCH=1
-exec "$qsa_root/bin/llama-server" \
+exec "$qsa_bin" \
   -m "$qsa_model_dir/Qwen3.8-27B-QSA-Q8_0.gguf" \
   --mmproj "$qsa_model_dir/mmproj-Qwen3.8-27B-QSA-F16.gguf" \
   --alias qwen3.8-27b-qsa,qwen3.8-27b-qsa-text \
