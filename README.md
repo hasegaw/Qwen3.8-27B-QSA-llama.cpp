@@ -12,9 +12,9 @@ Qwen Sparse Attention (QSA) uses a learned, compressed indexer to select context
 
 All KV entries remain allocated. QSA reduces attention computation and KV reads; it does not compress the KV cache. The native engine supports text, images, and video with M-RoPE, MTP with up to two draft tokens, and target/indexer/MTP cache reuse in one live slot. The cache is not stored on disk and does not survive a server restart.
 
-![QSA indexer and sparse core attention architecture](docs/assets/qsa-overview.png)
+![Architecture of the original Qwen3.8-27B and the QSA adaptation](docs/assets/qsa-architecture-en.png)
 
-QSA architecture reproduced from Figure 3 (p. 5) of [*On the Design of Qwen3.8-Next Architecture: Evaluation, Efficiency, and Training Stability*](https://arxiv.org/abs/2608.30320).
+Original Qwen3.8-27B (left) and the QSA adaptation with 16 learned indexers (right).
 
 ## Quick install and start
 

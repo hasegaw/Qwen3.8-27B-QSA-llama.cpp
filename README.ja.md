@@ -12,9 +12,9 @@ Qwen Sparse Attention（QSA）は、学習済みの圧縮indexerを使って4ト
 
 KVはすべて保持するため、QSAはKVキャッシュを圧縮する方式ではありません。注意計算とKV読み出しを減らす方式です。nativeエンジンはM-RoPEに対応したテキスト・画像・動画、最大2個のdraft tokenを使うMTP、1つの稼働中slotでの本体・indexer・MTPキャッシュ再利用をサポートします。このキャッシュはディスクには保存されず、サーバー再起動後には引き継がれません。
 
-![QSAのindexerと疎なcore attentionの構成](docs/assets/qsa-overview.png)
+![元のQwen3.8-27BとQSA適応後のモデルアーキテクチャ](docs/assets/qsa-architecture-ja.png)
 
-図は[*On the Design of Qwen3.8-Next Architecture: Evaluation, Efficiency, and Training Stability*](https://arxiv.org/abs/2608.30320)のFigure 3（5ページ）を引用しています。
+左が元のQwen3.8-27B、右が16個の学習済みindexerを追加したQSA版です。
 
 ## クイックインストールと起動
 
