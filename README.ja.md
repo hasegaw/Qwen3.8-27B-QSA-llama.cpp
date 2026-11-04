@@ -1,5 +1,7 @@
 # Qwen3.8-27B QSA for llama.cpp
 
+![Qwen3.8-27B + QSA ティザー](docs/assets/qsa-teaser.jpg)
+
 [English](README.md) | [日本語](README.ja.md)
 
 [推論エンジン](https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp) | [GGUFと実行環境](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF) | [BF16 weights](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-BF16) | [QSA論文](https://arxiv.org/abs/2608.30320) | [X](https://x.com/_ryu15_)
