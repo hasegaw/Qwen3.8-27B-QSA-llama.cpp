@@ -1043,7 +1043,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 
 // Block-sparse attention kernel (CUDA, Q8_0 K/V, head size 256): each query reads its selected
 // blocks straight from the cache. It lets the fast path take prompt batches too.
-// LLAMA_QSA_SPARSE_KERNEL=0 keeps the gather + flash attention path (and its 16-token limit).
+// LLAMA_QSA_SPARSE_KERNEL=0 disables the sparse kernels and limits the pooled path to small batches.
 static bool qwen4exp_qsa_sparse_kernel_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("LLAMA_QSA_SPARSE_KERNEL");
@@ -1867,7 +1867,10 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         const char * env = getenv("LLAMA_QSA27B_MASKED_PREFILL_MAX");
         return env ? std::max<int64_t>(0, atoll(env)) : int64_t(65536);
     }();
-    if (model.arch == LLM_ARCH_QWEN35 && n_tok > 16 && inp->mctx->get_n_kv() <= masked_prefill_max) {
+    const auto dev = model.dev_layer(il);
+    const auto * backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+    const bool metal = strcmp(backend, "MTL") == 0;
+    if (model.arch == LLM_ARCH_QWEN35 && (metal || (n_tok > 16 && inp->mctx->get_n_kv() <= masked_prefill_max))) {
         const int64_t nkv = inp->mctx->get_n_kv();
         auto * offsets = ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0, float(r), 1), r, 1, 1);
         auto * starts = ggml_scale(ctx0, ggml_cast(ctx0, ids, GGML_TYPE_F32), float(r));
@@ -1885,8 +1888,10 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
             mask = ggml_pad(ctx0, mask, 0, inp->get_kq_mask()->ne[1] - n_tok, 0, 0);
         }
         mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        // Padding repeats the tail block, so it adds no positions to the mask.
+        const int64_t n_kv_max = metal && qwen4exp_qsa_sparse_kernel_enabled() ? (top_blk->ne[0] + 1)*r : 0;
         auto * cur = build_attn_mha(q_cur, inp->mctx->get_k(ctx0, il), inp->mctx->get_v(ctx0, il),
-                nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
+                nullptr, mask, nullptr, nullptr, n_kv_max, kq_scale, il);
         if (inp->self_v_rot) { cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot); }
         return cur;
     }
