@@ -24,14 +24,18 @@ KVはすべて保持するため、QSAはKVキャッシュを圧縮する方式�
 
 ```sh
 python3 -m pip install --user -U huggingface_hub
-hf download higa2515/Qwen3.8-27B-QSA-GGUF --local-dir qsa27b
+hf download higa2515/Qwen3.8-27B-QSA-GGUF \
+  Qwen3.8-27B-QSA-Q8_0.gguf mmproj-Qwen3.8-27B-QSA-F16.gguf \
+  qsa27b-linux-x86_64-sm70.tar.gz SHA256SUMS --local-dir qsa27b
 cd qsa27b
-sha256sum -c SHA256SUMS
+grep -E '  (Qwen3[.]8-27B-QSA-Q8_0[.]gguf|mmproj-Qwen3[.]8-27B-QSA-F16[.]gguf|qsa27b-linux-x86_64-sm70[.]tar[.]gz)$' SHA256SUMS | sha256sum -c -
 tar -xzf qsa27b-linux-x86_64-sm70.tar.gz
 QSA_MODEL_DIR="$PWD" ./qsa27b-runtime/launch.sh
 ```
 
 サーバーの既定の待受先は127.0.0.1:8091で、OpenAI互換APIは`http://127.0.0.1:8091/v1`です。外部から利用するときだけ`QSA_HOST=0.0.0.0`を設定してください。同じGPUでは別のモデルを同時に実行しないでください。
+
+GPU別のビルド設定、単一・複数GPUの起動例、実測VRAM使用量は[GPUセットアップガイド](qsa27b/GPU-GUIDE.ja.md)を参照してください。
 
 ## ソースからビルド
 

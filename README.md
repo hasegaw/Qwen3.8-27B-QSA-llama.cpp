@@ -24,14 +24,18 @@ The captured runtime targets Linux x86_64 and NVIDIA sm70. Its validated configu
 
 ```sh
 python3 -m pip install --user -U huggingface_hub
-hf download higa2515/Qwen3.8-27B-QSA-GGUF --local-dir qsa27b
+hf download higa2515/Qwen3.8-27B-QSA-GGUF \
+  Qwen3.8-27B-QSA-Q8_0.gguf mmproj-Qwen3.8-27B-QSA-F16.gguf \
+  qsa27b-linux-x86_64-sm70.tar.gz SHA256SUMS --local-dir qsa27b
 cd qsa27b
-sha256sum -c SHA256SUMS
+grep -E '  (Qwen3[.]8-27B-QSA-Q8_0[.]gguf|mmproj-Qwen3[.]8-27B-QSA-F16[.]gguf|qsa27b-linux-x86_64-sm70[.]tar[.]gz)$' SHA256SUMS | sha256sum -c -
 tar -xzf qsa27b-linux-x86_64-sm70.tar.gz
 QSA_MODEL_DIR="$PWD" ./qsa27b-runtime/launch.sh
 ```
 
 The server listens on 127.0.0.1:8091 by default, with the OpenAI-compatible API at `http://127.0.0.1:8091/v1`. Set `QSA_HOST=0.0.0.0` only when remote access is required. Do not run another model on the same GPUs.
+
+For GPU-specific build settings, single- and multi-GPU launch examples, and measured VRAM use, see the [GPU setup guide](qsa27b/GPU-GUIDE.md).
 
 ## Build from source
 
