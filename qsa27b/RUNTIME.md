@@ -7,15 +7,15 @@ the captured ELF RUNPATH still refers to the original build location.
 
 ## Start
 
-Put the two GGUF files from the sibling HF repository in one directory:
+Put the selected GGUF model and shared mmproj from the sibling HF repository in one directory. The default model is Q8_0; set QSA_MODEL to select another variant:
 
 ```sh
-QSA_MODEL_DIR=/path/to/gguf ./launch.sh
+QSA_MODEL=Qwen3.8-27B-QSA-Unsloth-UD-Q5_K_M.gguf QSA_MODEL_DIR=/path/to/gguf ./launch.sh
 ```
 
-Default: localhost:8091, two sm70 32GB GPUs, layer split 1:1, context 262144,
+The captured reference configuration uses Q8_0, localhost:8091, two sm70 32GB GPUs, layer split 1:1, context 262144,
 FP16 KV, batch2048/ubatch512, one slot, MTP draft2, lag0/async0.
-QSA_HOST, QSA_PORT, QSA_CONTEXT, QSA_BIN and CUDA_HOME can be overridden.
+QSA_MODEL, QSA_HOST, QSA_PORT, QSA_CONTEXT, QSA_BIN and CUDA_HOME can be overridden.
 Extra server arguments are passed through. No daemon or system configuration is changed.
 Do not run this model alongside another model that occupies the same GPUs.
 
