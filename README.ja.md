@@ -4,9 +4,20 @@
 
 [English](README.md) | [日本語](README.ja.md)
 
-[推論エンジン](https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp) | [GGUFと実行環境](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF) | [BF16 weights](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-BF16) | [QSA論文](https://arxiv.org/abs/2608.30320) | [X](https://x.com/_ryu15_)
+[QSA論文](https://arxiv.org/abs/2608.30320) | [推論エンジン](https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp) | [GGUFモデルシリーズ](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF) | [BF16 weights](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-BF16) | [Unsloth GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | [X](https://x.com/_ryu15_)
 
-このリポジトリはQSA・マルチモーダル入力・MTP・稼働中のprefixキャッシュ再利用に対応したQwen3.8-27B向けの専用llama.cpp推論エンジンです。重みと収録済みruntimeは[GGUFリリース](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF)からダウンロードできます。
+このリポジトリは、QSA・マルチモーダル入力・MTP・稼働中のprefixキャッシュ再利用に対応したQwen3.8-27B向けの専用llama.cpp推論エンジンです。[GGUFモデルシリーズ](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF)には、Q8_0とUnsloth UD-Q4_K_M・UD-Q5_K_M・UD-Q6_Kがあります。アーキテクチャの参照元は[*On the Design of Qwen3.8-Next Architecture: Evaluation, Efficiency, and Training Stability*](https://arxiv.org/abs/2608.30320)です。
+
+## モデルバリアント
+
+| バリアント | 出典とサイズ |
+| --- | --- |
+| `Qwen3.8-27B-QSA-Q8_0.gguf` | QSA BF16リリースからのQ8_0変換、29.26 GB |
+| `Qwen3.8-27B-QSA-Unsloth-UD-Q4_K_M.gguf` | Unsloth UD混合精度レシピ、16.67 GB |
+| `Qwen3.8-27B-QSA-Unsloth-UD-Q5_K_M.gguf` | Unsloth UD混合精度レシピ、19.98 GB |
+| `Qwen3.8-27B-QSA-Unsloth-UD-Q6_K.gguf` | Unsloth UD混合精度レシピ、22.19 GB |
+
+Unsloth版は[unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/4ca720788d1e01f1bff70c033e0d0028fd02e502)の866個のtensorを、MTPの15個も含めてbyte単位で維持しています。同じ80個のFP32 QSA indexer tensorを追加しており、再学習や再量子化はしていません。UDは混合精度レシピであり、全tensorが一律のbit数ではありません。
 
 ## QSAの概要
 
@@ -20,7 +31,7 @@ KVはすべて保持するため、QSAはKVキャッシュを圧縮する方式�
 
 ## クイックインストールと起動
 
-収録済みruntimeの対象はLinux x86_64とNVIDIA sm70です。検証済みの構成では32GB GPU 2台、CUDA 12.9、FP16 KV、262,144トークンのコンテキストを使用します。Hugging Face CLIをインストールし、リリースのダウンロードとhash確認をしてからサーバーを起動してください。
+収録済みruntimeの対象はLinux x86_64とNVIDIA sm70です。基準構成では32GB GPU 2台、CUDA 12.9、FP16 KV、262,144トークンのコンテキストを使用します。このクイックインストールではQ8_0を選択し、必要なruntimeファイルだけをダウンロードします。
 
 ```sh
 python3 -m pip install --user -U huggingface_hub
@@ -35,7 +46,7 @@ QSA_MODEL_DIR="$PWD" ./qsa27b-runtime/launch.sh
 
 サーバーの既定の待受先は127.0.0.1:8091で、OpenAI互換APIは`http://127.0.0.1:8091/v1`です。外部から利用するときだけ`QSA_HOST=0.0.0.0`を設定してください。同じGPUでは別のモデルを同時に実行しないでください。
 
-GPU別のビルド設定、単一・複数GPUの起動例、実測VRAM使用量は[GPUセットアップガイド](qsa27b/GPU-GUIDE.ja.md)を参照してください。
+Unsloth版の選択、GPU別のビルド設定、単一・複数GPUの起動例、実測VRAM使用量は[GPUセットアップガイド](qsa27b/GPU-GUIDE.ja.md)を参照してください。
 
 ## ソースからビルド
 
@@ -51,6 +62,7 @@ CUDA_HOME=/usr/local/cuda-12.9 bash qsa27b/build.sh
 
 ```sh
 QSA_BIN="$PWD/build-qsa/bin/llama-server" \
+QSA_MODEL=Qwen3.8-27B-QSA-Q8_0.gguf \
 QSA_MODEL_DIR=/path/to/gguf \
 bash qsa27b/launch-captured-runtime.sh
 ```
@@ -70,16 +82,28 @@ BF16研究参照版で元のdense経路と比較した結果です。Q8_0 native
 
 DocVQAの結果は標準の自由回答DocVQAによる評価ではありません。これらの小規模な確認から、一般的な性能維持率や広範な品質同等性を示すことはできません。nativeのマルチモーダル確認は64kまでの限定的なprobeにとどまります。
 
-### テキスト速度のQSA・Dense比較
+### Unsloth Q4 / Q5 / Q6のテキスト確認
 
-両方の経路で同じQ8_0 GGUF、FP16 KV、MTP draft2、エンジン、sm70の32GB GPU 2台を使用しました。Denseは`LLAMA_QSA_DENSE=1`で元の16個の全注意層を通常attentionに戻した対照です。48個のGated DeltaNet層は両方で保持しています。課題はコード2種類と散文2種類を混合しました。
+6つの固定windowで、最大65,024入力トークン、FP16 KV、MTP無効のteacher-forced評価を行いました。PPL差は各量子化モデル内のdenseに対するQSAの相対差です。
+
+| バリアント | 全地点のPPL差 | 64k capture | 同予算oracle | 64k文章のPPL差 |
+| --- | ---: | ---: | ---: | ---: |
+| UD-Q4_K_M | -1.41% | 73.82% | 82.93% | +2.44% |
+| UD-Q5_K_M | -0.47% | 73.76% | 82.91% | +1.97% |
+| UD-Q6_K | -0.35% | 73.89% | 83.04% | +1.76% |
+
+captureは注意質量の捕捉率で、タスクの正答率ではありません。oracleは同じ予算でその質量を最大化した値です。このテキスト評価から、一般的な品質同等性、自由生成の品質、BF16との比較は示せません。[評価の全データ](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF/tree/main/unsloth-qsa)も公開しています。
+
+### Q8_0の速度比較
+
+次の結果はQ8_0だけに適用され、Unsloth版の結果ではありません。両方の経路で同じQ8_0 GGUF、FP16 KV、MTP draft2、エンジン、sm70の32GB GPU 2台を使用しました。Denseは`LLAMA_QSA_DENSE=1`で元の16個の全注意層を通常attentionに戻した対照です。48個のGated DeltaNet層は両方で保持しています。
 
 | 入力トークン | QSA cold prefill | Dense cold prefill | QSA decode | Dense decode |
 | ---: | ---: | ---: | ---: | ---: |
 | 0 | 660.75 | 658.87 | 49.28 | 49.87 |
 | 261,120 | 1071.53 | 366.84 | 41.07 | 22.91 |
 
-単位はすべてtoken/sです。261,120入力トークンでは、QSAはdecodeが1.793倍、cold prefillが2.921倍でした。それぞれ再測定した0k時点からの混合decode低下率は、QSAが16.66%、Denseが54.06%です。0kのpromptにも490〜563 tokenが含まれます。
+単位はすべてtoken/sです。261,120入力トークンでは、QSAはdecodeが1.793倍、cold prefillが2.921倍でした。それぞれ再測定した0k時点からの混合decode低下率は、QSAが16.66%、Denseが54.06%です。課題はコード2種類と散文2種類を混合し、0kのpromptにも490〜563 tokenが含まれます。
 
 QSAの0以外の深度は以前の同条件runの測定値を使い、QSAとDenseは別セッションで測りました。同時・交互の反復A/Bではないため、信頼区間や一般的な品質の主張はしません。[比較データと方法](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF/tree/main/benchmark)も公開しています。
 
@@ -91,6 +115,7 @@ QSAの0以外の深度は以前の同条件runの測定値を使い、QSAとDens
 - [pentaCoxian](https://github.com/pentaCoxian): V100向けllama.cpp基盤とruntime最適化。
 - [Warabii1248](https://github.com/Warabii1248): 基盤エンジンに取り込まれたV100 patch群。
 - [ggml-org contributors](https://github.com/ggml-org/llama.cpp): 上流のllama.cpp。
-- [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B): 元モデルとQSAアーキテクチャの参照元。
+- [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B): 元モデルと[QSAアーキテクチャ論文](https://arxiv.org/abs/2608.30320)。
+- [Unsloth](https://github.com/unslothai/unsloth)と[Unsloth Qwen3.8-27B GGUFリポジトリ](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF): UD混合精度レシピと、Q4 / Q5 / Q6で再利用した866個の元tensor。
 
-上流のREADMEは[README.upstream.md](README.upstream.md)に保存しています。エンジンコードはMITとthird-party noticesを保持し、モデルファイルはApache-2.0を保持します。
+上流のREADMEは[README.upstream.md](README.upstream.md)に保存しています。エンジンコードはMITとthird-party noticesを保持し、モデルファイルはApache-2.0と上流のnoticeを保持します。
