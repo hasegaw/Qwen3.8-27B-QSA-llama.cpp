@@ -1821,10 +1821,14 @@ bool server_prompt_cache::disk_spill(server_prompt_cache_state & st) {
         ck.push_back({ cp.data_tgt.size(), cp.data_dft.size(), cp.data_spec.size() });
     }
     const int err = ok ? 0 : errno;
+#ifdef __APPLE__
+    ok = ok && ::fsync(fd) == 0;
+#else
     ok = ok && ::fdatasync(fd) == 0;
     if (ok) {
         posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     }
+#endif
     ::close(fd);
     if (!ok) {
         SRV_WRN("[pc-disk] write %s failed: %s; entry dropped\n", path.c_str(), strerror(err ? err : errno));
@@ -2068,7 +2072,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             cp.data_spec.assign(base + off, base + off + s[2]); off += s[2];
         }
         munmap(map, total);
+#ifndef __APPLE__
         posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
         ::close(fd);
         disk_remove(*it_disk);
         if (!ok || off != total) {
