@@ -2869,6 +2869,21 @@ bool llama_kv_cache_context::ubatch_cells_follow() const {
     return cells.used_max_p1() == end && cells.get_used() == end;
 }
 
+bool llama_kv_cache_context::ubatch_cells_are_causal() const {
+    if (!ubatch_cells_follow()) {
+        return false;
+    }
+
+    const auto & ubatch = ubatches[i_cur];
+    if (!ubatch.token || ubatch.n_seqs_unq != 1) {
+        return false;
+    }
+
+    const llama_seq_id seq = ubatch.seq_id[0][0];
+    const uint32_t start = sinfos[i_cur].idxs[0][0];
+    return kv->get_cells(seq).seq_has_ordered_tail(seq, start, start + sinfos[i_cur].size());
+}
+
 uint32_t llama_kv_cache_context::ubatch_cell0() const {
     GGML_ASSERT(has_ubatch() && sinfos[i_cur].size() > 0);
     return sinfos[i_cur].idxs[0][0];

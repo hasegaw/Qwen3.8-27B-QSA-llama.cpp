@@ -1186,6 +1186,28 @@ kernel void kernel_flash_attn_ext_vec_idx(
     }
 }
 
+// QSA uses four KV cells per selected block. Its compact mask already
+// excludes future cells, duplicate tail blocks and padding.
+kernel void kernel_flash_attn_ext_vec_qsa_idx(
+        constant ggml_metal_kargs_flash_attn_ext_vec_idx & args,
+        device const half * mask,
+        device       int  * idx,
+        device const int  * blocks,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const int row = tgpig.x;
+    device const half * row_mask = (device const half *) ((device const char *) mask + row*args.nb31);
+    device const int * row_blocks = blocks + (int64_t) row*(args.ne30/4);
+    device int * row_idx = idx + (int64_t) row*args.n_kv_max_padded;
+
+    for (int i = tid; i < args.n_kv_max_padded; i += ntg.x) {
+        row_idx[i] = i < args.n_kv_max && isfinite((float) row_mask[i])
+            ? 4*row_blocks[i/4] + i%4
+            : -1;
+    }
+}
+
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -1407,6 +1429,9 @@ kernel void kernel_flash_attn_ext_vec(
                         }
                     }
                 }
+            } else if (FC_flash_attn_ext_vec_has_sparse) {
+                // A direct index list encodes the binary mask with -1 entries.
+                sm[tiisg] = pidx[ic + tiisg] >= 0 ? 0.0h : -MAXHALF;
             } else {
                 FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                     if ((iq1*Q + qq) >= args.ne01) {

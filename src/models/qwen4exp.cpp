@@ -1,4 +1,6 @@
 #include "models.h"
+
+#include <optional>
 #include "llama-impl.h"
 #include "llama-ft-moe.h"
 #include "llama-memory-hybrid-idx.h"
@@ -1287,6 +1289,9 @@ public:
         // and the row count must come from the same formula as the graph being reused
         res = res && mctx->blk_rebuild() == rebuild;
         res = res && touch_src->ne[0] == n_touch(params.ubatch.n_tokens, (res && rebuild) ? (int64_t) mctx->get_idx()->ubatch_cell0() : 0, ratio, rebuild);
+        if (res && direct_layout.has_value()) {
+            res = *direct_layout == mctx->get_attn()->ubatch_cells_are_causal();
+        }
         if (res && fast) {
             res = vis->ne[1] == params.ubatch.n_tokens && k_idxs->ne[0] == params.ubatch.n_tokens &&
                   sel_mask->ne[3] == params.ubatch.n_tokens;
@@ -1306,6 +1311,7 @@ public:
 
     // graph node, not an input: the visibility bias built from vis, shared by the layers
     ggml_tensor * vis_bias  = nullptr;
+    std::optional<bool> direct_layout;
 
     const llama_memory_hybrid_idx_context * mctx;
     const llama_cparams   cparams;  // [v4bits] a copy: the graph context's cparams live in the caller's llm_graph_params
@@ -1870,7 +1876,24 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
     const auto dev = model.dev_layer(il);
     const auto * backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
     const bool metal = strcmp(backend, "MTL") == 0;
-    if (model.arch == LLM_ARCH_QWEN35 && (metal || (n_tok > 16 && inp->mctx->get_n_kv() <= masked_prefill_max))) {
+    auto * k_all = mctx_cur->get_k(ctx0, il);
+    auto * v_all = mctx_cur->get_v(ctx0, il);
+    const int64_t n_selected_cells = (top_blk->ne[0] + 1)*r;
+    static const bool metal_direct_enabled = [] {
+        const char * env = getenv("LLAMA_QSA_METAL_DIRECT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const bool metal_direct_supported = metal && model.arch == LLM_ARCH_QWEN35 &&
+        metal_direct_enabled && qwen4exp_qsa_sparse_kernel_enabled() && !hparams.is_swa(il) &&
+        r == 4 && n_selected_cells <= 4096 && k_all->ne[3] == 1 &&
+        k_all->ne[0] == 256 && v_all->ne[0] == 256 && k_all->type == v_all->type &&
+        (k_all->type == GGML_TYPE_F16 || k_all->type == GGML_TYPE_Q8_0 || k_all->type == GGML_TYPE_Q4_0);
+    if (metal_direct_supported && !blk_inp->direct_layout.has_value()) {
+        blk_inp->direct_layout = mctx_cur->ubatch_cells_are_causal();
+    }
+    const bool metal_direct = metal_direct_supported && blk_inp->direct_layout.value_or(false);
+    if (!metal_direct && model.arch == LLM_ARCH_QWEN35 &&
+            (metal || (n_tok > 16 && inp->mctx->get_n_kv() <= masked_prefill_max))) {
         const int64_t nkv = inp->mctx->get_n_kv();
         auto * offsets = ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0, float(r), 1), r, 1, 1);
         auto * starts = ggml_scale(ctx0, ggml_cast(ctx0, ids, GGML_TYPE_F32), float(r));
@@ -1909,9 +1932,15 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
     }
 
 
+    if (metal_direct) {
+        auto * mask = ggml_reshape_2d(ctx0, selected_mask, n_wblk*r, n_tok);
+        auto * cur = build_attn_mha(q_cur, k_all, v_all, nullptr, mask, nullptr, nullptr,
+                n_selected_cells, kq_scale, il, ids);
+        if (inp->self_v_rot) { cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot); }
+        return cur;
+    }
+
     {
-        ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
-        ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
         // decode-sized batches keep the gather + flash attention path (as fast there); prompt batches,
         // which the gather path cannot take, use the sparse kernel
         // (q and the cached K/V are already Hadamard-rotated alike when the cache rotates them)
@@ -1966,7 +1995,6 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         return ggml_reshape_4d(ctx0, g, cache->ne[0], cache->ne[1], n_wblk*r, n_tok);
     };
 
-    ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
     GGML_ASSERT(v_all->nb[1] <= v_all->nb[2] && "block attention needs a non-transposed V cache");
 
     ggml_tensor * k = gather(mctx_cur->get_k(ctx0, il));

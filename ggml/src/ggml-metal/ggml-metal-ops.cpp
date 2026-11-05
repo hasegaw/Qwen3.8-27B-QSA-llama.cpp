@@ -3114,6 +3114,10 @@ size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
+    if (op->src[6]) {
+        return 0;
+    }
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
   //GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
   //GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -3181,6 +3185,10 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (op->src[6]) {
+        return 0;
+    }
 
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
@@ -3264,7 +3272,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         scale /= logit_softcap;
     }
 
-    const bool has_mask  = op->src[3] != NULL;
+    const bool direct_qsa = op->src[6] != nullptr;
+    const bool has_mask  = op->src[3] != nullptr && !direct_qsa;
     const bool has_sinks = op->src[4] != NULL;
     const bool has_bias  = max_bias != 0.0f;
     const bool has_scap  = logit_softcap != 0.0f;
@@ -3280,7 +3289,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
     ggml_metal_buffer_id bid_src2 = ggml_metal_get_buffer_id(op->src[2]);
-    ggml_metal_buffer_id bid_src3 = has_mask  ? ggml_metal_get_buffer_id(op->src[3]) : bid_src0;
+    ggml_metal_buffer_id bid_src3 = op->src[3] ? ggml_metal_get_buffer_id(op->src[3]) : bid_src0;
     ggml_metal_buffer_id bid_src4 = has_sinks ? ggml_metal_get_buffer_id(op->src[4]) : bid_src0;
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
@@ -3300,6 +3309,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     // sparse path: gather the finite mask entries into index lists and run the vec kernels over them
     const int n_kv_max_sparse = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
     const bool use_sparse = n_kv_max_sparse > 0;
+    GGML_ASSERT(!direct_qsa || use_sparse);
     const int n_kv_max_padded = use_sparse ? GGML_PAD(n_kv_max_sparse, OP_FLASH_ATTN_EXT_VEC_NCPSG) : 0;
 
     // the vec kernels dequantize the KV inline; no need for the F16 dequant pass in the sparse path
@@ -3605,7 +3615,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         if (use_sparse) {
             assert(ggml_metal_op_flash_attn_ext_extra_idx(op) != 0);
 
-            GGML_ASSERT(ne30 == ne11);
+            GGML_ASSERT(direct_qsa || ne30 == ne11);
 
             ggml_metal_kargs_flash_attn_ext_vec_idx args0 = {
                 /*.ne30              =*/ ne30,
@@ -3625,6 +3635,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_idx,  2);
+            if (direct_qsa) {
+                const auto * blocks = op->src[6];
+                GGML_ASSERT(blocks->type == GGML_TYPE_I32 && ggml_is_contiguous(blocks));
+                GGML_ASSERT(ne30 == 4*blocks->ne[0] && ne31 == blocks->ne[1]);
+                GGML_ASSERT(ne31 == ne01 && ne32 == 1 && ne33 == 1 && ne13 == 1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(blocks), 3);
+            }
 
             int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline0), 256);
             nth = std::max(32, (nth/32)*32);

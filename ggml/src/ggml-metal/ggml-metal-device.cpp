@@ -1790,7 +1790,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
 
     char name[256];
 
-    snprintf(name, 256, "kernel_flash_attn_ext_vec_idx");
+    snprintf(name, 256, "%s", op->src[6] ? "kernel_flash_attn_ext_vec_qsa_idx" : "kernel_flash_attn_ext_vec_idx");
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {

@@ -778,6 +778,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (dst->src[6]) {
+        return false;
+    }
     if (ggml_cuda_qsa_attn_is_sparse(dst)) {
         return ggml_cuda_qsa_attn_supported(dst);
     }
