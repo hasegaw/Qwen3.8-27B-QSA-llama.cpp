@@ -31,21 +31,22 @@ KVはすべて保持するため、QSAはKVキャッシュを圧縮する方式�
 
 ## クイックインストールと起動
 
-収録済みruntimeの対象はLinux x86_64とNVIDIA sm70です。基準構成では32GB GPU 2台、CUDA 12.9、FP16 KV、262,144トークンのコンテキストを使用します。まず使用するモデルバリアントを選択してください。
+収録済みruntimeの対象はLinux x86_64とNVIDIA sm70です。基準構成では32GB GPU 2台、CUDA 12.9、FP16 KV、262,144トークンのコンテキストを使用します。このクイックインストールではQ8_0を選択し、必要なruntimeファイルだけをダウンロードします。
 
 ```sh
 python3 -m pip install --user -U huggingface_hub
-QSA_VARIANT=Qwen3.8-27B-QSA-Q8_0.gguf
-hf download higa2515/Qwen3.8-27B-QSA-GGUF   "$QSA_VARIANT"   mmproj-Qwen3.8-27B-QSA-F16.gguf   qsa27b-linux-x86_64-sm70.tar.gz   SHA256SUMS release-manifest.json   --local-dir qsa27b
+hf download higa2515/Qwen3.8-27B-QSA-GGUF \
+  Qwen3.8-27B-QSA-Q8_0.gguf mmproj-Qwen3.8-27B-QSA-F16.gguf \
+  qsa27b-linux-x86_64-sm70.tar.gz SHA256SUMS --local-dir qsa27b
 cd qsa27b
-sha256sum -c SHA256SUMS --ignore-missing
+grep -E '  (Qwen3[.]8-27B-QSA-Q8_0[.]gguf|mmproj-Qwen3[.]8-27B-QSA-F16[.]gguf|qsa27b-linux-x86_64-sm70[.]tar[.]gz)$' SHA256SUMS | sha256sum -c -
 tar -xzf qsa27b-linux-x86_64-sm70.tar.gz
-QSA_MODEL="$QSA_VARIANT" QSA_MODEL_DIR="$PWD" ./qsa27b-runtime/launch.sh
+QSA_MODEL_DIR="$PWD" ./qsa27b-runtime/launch.sh
 ```
 
-例えば、Unsloth Q5を使う場合は`QSA_VARIANT=Qwen3.8-27B-QSA-Unsloth-UD-Q5_K_M.gguf`を指定してください。そのファイルもダウンロードしてから、同じ展開・起動手順を使います。
-
 サーバーの既定の待受先は127.0.0.1:8091で、OpenAI互換APIは`http://127.0.0.1:8091/v1`です。外部から利用するときだけ`QSA_HOST=0.0.0.0`を設定してください。同じGPUでは別のモデルを同時に実行しないでください。
+
+Unsloth版の選択、GPU別のビルド設定、単一・複数GPUの起動例、実測VRAM使用量は[GPUセットアップガイド](qsa27b/GPU-GUIDE.ja.md)を参照してください。
 
 ## ソースからビルド
 

@@ -31,21 +31,22 @@ Original Qwen3.8-27B (left) and the QSA adaptation with 16 learned indexers (rig
 
 ## Quick install and start
 
-The captured runtime targets Linux x86_64 and NVIDIA sm70. Its reference configuration uses two 32GB GPUs, CUDA 12.9, FP16 KV, and a 262,144-token context. Select one model variant before downloading:
+The captured runtime targets Linux x86_64 and NVIDIA sm70. Its reference configuration uses two 32GB GPUs, CUDA 12.9, FP16 KV, and a 262,144-token context. This quick install selects Q8_0 and downloads only the runtime files it needs:
 
 ```sh
 python3 -m pip install --user -U huggingface_hub
-QSA_VARIANT=Qwen3.8-27B-QSA-Q8_0.gguf
-hf download higa2515/Qwen3.8-27B-QSA-GGUF   "$QSA_VARIANT"   mmproj-Qwen3.8-27B-QSA-F16.gguf   qsa27b-linux-x86_64-sm70.tar.gz   SHA256SUMS release-manifest.json   --local-dir qsa27b
+hf download higa2515/Qwen3.8-27B-QSA-GGUF \
+  Qwen3.8-27B-QSA-Q8_0.gguf mmproj-Qwen3.8-27B-QSA-F16.gguf \
+  qsa27b-linux-x86_64-sm70.tar.gz SHA256SUMS --local-dir qsa27b
 cd qsa27b
-sha256sum -c SHA256SUMS --ignore-missing
+grep -E '  (Qwen3[.]8-27B-QSA-Q8_0[.]gguf|mmproj-Qwen3[.]8-27B-QSA-F16[.]gguf|qsa27b-linux-x86_64-sm70[.]tar[.]gz)$' SHA256SUMS | sha256sum -c -
 tar -xzf qsa27b-linux-x86_64-sm70.tar.gz
-QSA_MODEL="$QSA_VARIANT" QSA_MODEL_DIR="$PWD" ./qsa27b-runtime/launch.sh
+QSA_MODEL_DIR="$PWD" ./qsa27b-runtime/launch.sh
 ```
 
-For example, set `QSA_VARIANT=Qwen3.8-27B-QSA-Unsloth-UD-Q5_K_M.gguf` to use the Unsloth Q5 model. Download that file first, then use the same extraction and launch commands.
-
 The server listens on 127.0.0.1:8091 by default, with the OpenAI-compatible API at `http://127.0.0.1:8091/v1`. Set `QSA_HOST=0.0.0.0` only when remote access is required. Do not run another model on the same GPUs.
+
+For Unsloth model selection, GPU-specific build settings, single- and multi-GPU launch examples, and measured VRAM use, see the [GPU setup guide](qsa27b/GPU-GUIDE.md).
 
 ## Build from source
 
