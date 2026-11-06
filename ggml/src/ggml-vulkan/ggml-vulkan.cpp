@@ -3025,6 +3025,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
     }
 
+    ggml_vk_create_pipeline(device, device->pipeline_qsa_attn_f16, "qsa_attn_f16", qsa_attn_f16_len, qsa_attn_f16_data, "main", 6, sizeof(vk_qsa_attn_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_qsa_attn_q8_0, "qsa_attn_q8_0", qsa_attn_q8_0_len, qsa_attn_q8_0_data, "main", 6, sizeof(vk_qsa_attn_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_qsa_attn_q4_0, "qsa_attn_q4_0", qsa_attn_q4_0_len, qsa_attn_q4_0_data, "main", 6, sizeof(vk_qsa_attn_push_constants), {1, 1, 1}, {}, 1, true);
+
     {
         // Large workgroup so the per-row KV scan parallelizes; capped to device limits.
         const uint32_t compact_max = std::min({1024u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
@@ -7786,6 +7790,98 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+static bool ggml_vk_qsa_attn_supported(const vk_device & device, const ggml_tensor * dst) {
+    const auto * q = dst->src[0];
+    const auto * k = dst->src[1];
+    const auto * v = dst->src[2];
+    const auto * mask = dst->src[3];
+    const auto * ids = dst->src[5];
+
+    if (!mask || dst->src[4] || dst->src[6] ||
+        ggml_get_op_params_i32(dst, 6) != 4 || dst->op_params[1] != 0 || dst->op_params[2] != 0 ||
+        q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F16 ||
+        ids->type != GGML_TYPE_I32 || (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0) ||
+        v->type != k->type) {
+        return false;
+    }
+
+    const auto & limits = device->properties.limits;
+    return q->ne[0] == 256 && k->ne[0] == 256 && v->ne[0] == 256 &&
+           q->ne[1] > 0 && q->ne[2] > 0 && k->ne[1] > 0 && q->ne[1] % k->ne[1] == 0 && k->ne[1] == v->ne[1] &&
+           k->ne[2] == v->ne[2] && k->ne[2] % 4 == 0 &&
+           q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+           q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) &&
+           v->nb[0] == ggml_type_size(v->type) &&
+           ids->ne[1] == q->ne[2] && ids->ne[2] == 1 && ids->ne[3] == 1 &&
+           mask->ne[0] == 4 * ids->ne[0] && mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == q->ne[2] &&
+           dst->ne[0] == 256 && dst->ne[1] == q->ne[1] && dst->ne[2] == q->ne[2] && dst->ne[3] == 1 &&
+           ggml_is_contiguous(ids) && ggml_is_contiguous(mask) && ggml_is_contiguous(dst) &&
+           q->ne[1] <= limits.maxComputeWorkGroupCount[0] && q->ne[2] <= limits.maxComputeWorkGroupCount[1] &&
+           ggml_nbytes(k) <= limits.maxStorageBufferRange && ggml_nbytes(v) <= limits.maxStorageBufferRange;
+}
+
+static void ggml_vk_qsa_attn(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_vk_qsa_attn_supported(ctx->device, dst));
+    const auto * q = dst->src[0];
+    const auto * k = dst->src[1];
+    const auto * v = dst->src[2];
+    const auto * mask = dst->src[3];
+    const auto * ids = dst->src[5];
+    const auto kv_unit = ggml_type_size(k->type);
+    vk_pipeline & pipeline = k->type == GGML_TYPE_F16 ? ctx->device->pipeline_qsa_attn_f16 :
+                              k->type == GGML_TYPE_Q8_0 ? ctx->device->pipeline_qsa_attn_q8_0 :
+                                                         ctx->device->pipeline_qsa_attn_q4_0;
+    const uint32_t n_heads = q->ne[1];
+    const uint32_t n_tokens = q->ne[2];
+    const uint32_t n_blocks = ids->ne[0];
+    const uint32_t n_rows = n_heads * n_tokens;
+    const uint32_t cores = ctx->device->shader_core_count ? ctx->device->shader_core_count : 64;
+    // Give small batches enough workgroups to fill the GPU.
+    const uint32_t max_splits = std::min({32u, 4 * cores / n_rows, n_blocks / 16});
+    const uint32_t n_splits = std::max(1u, max_splits);
+    const vk_qsa_attn_push_constants pc = {
+        n_heads, (uint32_t) (q->ne[1] / k->ne[1]), (uint32_t) k->ne[2], n_blocks, n_tokens, n_splits,
+        (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)),
+        (uint32_t) (k->nb[1] / kv_unit), (uint32_t) (k->nb[2] / kv_unit),
+        (uint32_t) (v->nb[1] / kv_unit), (uint32_t) (v->nb[2] / kv_unit),
+        ggml_get_op_params_f32(dst, 0),
+    };
+
+    const auto dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    auto out_buf = dst_buf;
+    if (n_splits > 1) {
+        const uint64_t split_size = uint64_t(n_rows) * n_splits * (256 + 2) * sizeof(float);
+        if (ctx->prealloc_size_split_k < split_size) {
+            ctx->prealloc_size_split_k = split_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        out_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const auto q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        q_buf,
+        ggml_vk_tensor_subbuffer(ctx, k),
+        ggml_vk_tensor_subbuffer(ctx, v),
+        ggml_vk_tensor_subbuffer(ctx, mask),
+        ggml_vk_tensor_subbuffer(ctx, ids),
+        out_buf,
+    }, pc, { n_heads, n_tokens, n_splits });
+
+    if (n_splits > 1) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        auto & reduce = ctx->device->pipeline_flash_attn_split_k_reduce;
+        ggml_pipeline_request_descriptor_sets(ctx, reduce, 1);
+        const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = { 256, n_heads, n_tokens, 1, n_splits, 0 };
+        ggml_vk_dispatch_pipeline(ctx, subctx, reduce, { out_buf, q_buf, dst_buf }, reduce_pc, { n_heads, 256, n_tokens });
+        ctx->prealloc_split_k_need_sync = true;
+    }
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -12408,7 +12504,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
-        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+        if (node->src[5]) {
+            ggml_vk_qsa_attn(ctx, compute_ctx, node);
+        } else {
+            ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+        }
 
         break;
 
@@ -15170,6 +15270,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                if (op->src[5]) {
+                    return ggml_vk_qsa_attn_supported(device, op);
+                }
+                if (op->src[6]) {
+                    return false;
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
@@ -16190,7 +16296,7 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
         const ggml_tensor * m = node->src[3];
         std::stringstream name;
         name << fusion_str;
-        name << ggml_op_name(node->op) <<
+        name << (node->src[5] ? "QSA_ATTN" : ggml_op_name(node->op)) <<
             " dst(" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << "), " <<
             " q(" << q->ne[0] << "," << q->ne[1] << "," << q->ne[2] << "," << q->ne[3] << "), " <<
             " k(" << k->ne[0] << "," << k->ne[1] << "," << k->ne[2] << "," << k->ne[3] << "), " <<

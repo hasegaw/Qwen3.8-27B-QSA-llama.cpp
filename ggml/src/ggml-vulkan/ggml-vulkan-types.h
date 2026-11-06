@@ -991,6 +991,9 @@ struct vk_device_struct {
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
+    vk_pipeline pipeline_qsa_attn_f16;
+    vk_pipeline pipeline_qsa_attn_q8_0;
+    vk_pipeline pipeline_qsa_attn_q4_0;
     vk_pipeline pipeline_fa_sparse_compact;
     vk_pipeline pipeline_fa_sparse_compact_subgroup;
     bool fa_sparse_compact_use_subgroups;

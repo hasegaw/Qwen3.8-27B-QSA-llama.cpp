@@ -1,0 +1,190 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#include "types.glsl"
+
+layout(local_size_x = 128) in;
+
+#ifdef DATA_A_Q8_0
+layout(binding = 1) readonly buffer K { block_q8_0_packed16 data_k[]; };
+layout(binding = 2) readonly buffer V { block_q8_0_packed16 data_v[]; };
+
+vec2 unpack_q8_0(int bits, float scale) {
+    return scale * vec2(bitfieldExtract(bits, 0, 8), bitfieldExtract(bits, 8, 8));
+}
+
+vec2 load_k(uint row, uint d) {
+    const uint block = row + d / 32;
+    return unpack_q8_0(int(data_k[block].qs[d % 32 / 2]), float(data_k[block].d));
+}
+
+vec2 load_v(uint row, uint d) {
+    const uint block = row + d / 32;
+    return unpack_q8_0(int(data_v[block].qs[d % 32 / 2]), float(data_v[block].d));
+}
+#elif defined(DATA_A_Q4_0)
+layout(binding = 1) readonly buffer K { block_q4_0_packed16 data_k[]; };
+layout(binding = 2) readonly buffer V { block_q4_0_packed16 data_v[]; };
+
+vec2 unpack_q4_0(uint bits, uint d, float scale) {
+    const uint shift = d % 32 < 16 ? 0 : 4;
+    const uint pair = (bits >> shift) & 0x0f0fu;
+    return scale * (vec2(pair & 0xfu, pair >> 8) - 8.0);
+}
+
+vec2 load_k(uint row, uint d) {
+    const uint block = row + d / 32;
+    return unpack_q4_0(uint(data_k[block].qs[d % 16 / 2]), d, float(data_k[block].d));
+}
+
+vec2 load_v(uint row, uint d) {
+    const uint block = row + d / 32;
+    return unpack_q4_0(uint(data_v[block].qs[d % 16 / 2]), d, float(data_v[block].d));
+}
+#else
+layout(binding = 1) readonly buffer K { float16_t data_k[]; };
+layout(binding = 2) readonly buffer V { float16_t data_v[]; };
+
+vec2 load_k(uint row, uint d) {
+    return vec2(data_k[row + d], data_k[row + d + 1]);
+}
+
+vec2 load_v(uint row, uint d) {
+    return vec2(data_v[row + d], data_v[row + d + 1]);
+}
+#endif
+
+layout(binding = 0) readonly buffer Q { float data_q[]; };
+layout(binding = 3) readonly buffer M { float16_t data_m[]; };
+layout(binding = 4) readonly buffer I { int data_i[]; };
+layout(binding = 5) writeonly buffer O { float data_o[]; };
+
+layout(push_constant) uniform parameter {
+    uint n_head;
+    uint gqa;
+    uint n_kv;
+    uint n_blocks;
+    uint n_tokens;
+    uint n_splits;
+    uint q_head_stride;
+    uint q_token_stride;
+    uint k_head_stride;
+    uint k_cell_stride;
+    uint v_head_stride;
+    uint v_cell_stride;
+    float scale;
+} p;
+
+const uint HEAD_SIZE = 256;
+const uint BLOCK_CELLS = 4;
+const uint TILE_CELLS = 16;
+const uint DOT_LANES = 8;
+const float NEG_INF = -1.0 / 0.0;
+
+shared int cells[TILE_CELLS];
+shared float partial[TILE_CELLS][DOT_LANES];
+shared float weights[TILE_CELLS];
+shared float rescale;
+shared float total;
+
+// One workgroup per query token and head.
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint split = gl_WorkGroupID.z;
+    const uint lane = gl_LocalInvocationIndex;
+    const uint kv_head = head / p.gqa;
+    const uint q_base = token * p.q_token_stride + head * p.q_head_stride;
+    const uint k_base = kv_head * p.k_head_stride;
+    const uint v_base = kv_head * p.v_head_stride;
+    const uint cell_lane = lane / DOT_LANES;
+    const uint dot_lane = lane % DOT_LANES;
+    const uint n_cells = p.n_blocks * BLOCK_CELLS;
+
+    const uint n_tiles = (n_cells + TILE_CELLS - 1) / TILE_CELLS;
+    const uint tile_start = split * n_tiles / p.n_splits;
+    const uint tile_end = (split + 1) * n_tiles / p.n_splits;
+
+    float max_score = NEG_INF;
+    vec2 acc = vec2(0.0);
+    if (lane == 0) {
+        total = 0.0;
+    }
+
+    for (uint tile = tile_start; tile < tile_end; ++tile) {
+        if (lane < TILE_CELLS) {
+            const uint slot = tile * TILE_CELLS + lane;
+            int cell = -1;
+            float bias = NEG_INF;
+            if (slot < n_cells) {
+                const int block = data_i[token * p.n_blocks + slot / BLOCK_CELLS];
+                if (block >= 0 && uint(block) < p.n_kv / BLOCK_CELLS) {
+                    bias = float(data_m[token * n_cells + slot]);
+                    if (bias != NEG_INF) {
+                        cell = block * int(BLOCK_CELLS) + int(slot % BLOCK_CELLS);
+                    }
+                }
+            }
+            cells[lane] = cell;
+            weights[lane] = bias;
+        }
+        barrier();
+
+        float sum = 0.0;
+        if (cells[cell_lane] >= 0) {
+            const uint row = k_base + uint(cells[cell_lane]) * p.k_cell_stride;
+            for (uint d = 2 * dot_lane; d < HEAD_SIZE; d += 2 * DOT_LANES) {
+                sum += dot(vec2(data_q[q_base + d], data_q[q_base + d + 1]), load_k(row, d));
+            }
+        }
+        partial[cell_lane][dot_lane] = sum;
+        barrier();
+
+        if (lane < TILE_CELLS) {
+            float score = 0.0;
+            for (uint i = 0; i < DOT_LANES; ++i) {
+                score += partial[lane][i];
+            }
+            weights[lane] = score * p.scale + weights[lane];
+        }
+        barrier();
+
+        // Update the online softmax across tiles.
+        if (lane == 0) {
+            float next_max = max_score;
+            for (uint i = 0; i < TILE_CELLS; ++i) {
+                next_max = max(next_max, weights[i]);
+            }
+            rescale = max_score == NEG_INF ? 0.0 : exp(max_score - next_max);
+            total *= rescale;
+            for (uint i = 0; i < TILE_CELLS; ++i) {
+                weights[i] = weights[i] == NEG_INF ? 0.0 : exp(weights[i] - next_max);
+                total += weights[i];
+            }
+            max_score = next_max;
+        }
+        barrier();
+
+        acc *= rescale;
+        for (uint i = 0; i < TILE_CELLS; ++i) {
+            if (weights[i] != 0.0) {
+                acc += weights[i] * load_v(v_base + uint(cells[i]) * p.v_cell_stride, 2 * lane);
+            }
+        }
+        barrier();
+    }
+
+    const uint split_row = (token * p.n_splits + split) * p.n_head;
+    const uint out_index = (split_row + head) * HEAD_SIZE + 2 * lane;
+    if (p.n_splits == 1) {
+        acc = total > 0.0 ? acc / total : vec2(0.0);
+    } else if (lane == 0) {
+        // Use the layout of the Flash Attention split-KV reducer.
+        const uint lm = p.n_tokens * p.n_splits * p.n_head * HEAD_SIZE + 2 * split_row + head;
+        data_o[lm] = total;
+        // A finite maximum keeps the reducer defined when all splits are masked.
+        data_o[lm + p.n_head] = total > 0.0 ? max_score : -uintBitsToFloat(0x7f7fffffu);
+    }
+    data_o[out_index] = acc.x;
+    data_o[out_index + 1] = acc.y;
+}
