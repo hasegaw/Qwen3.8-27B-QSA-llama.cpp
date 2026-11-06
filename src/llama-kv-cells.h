@@ -371,6 +371,22 @@ public:
         }
     }
 
+    // The sequence occupies the whole prefix, and its newest cells have strictly increasing positions.
+    bool seq_has_ordered_tail(llama_seq_id seq_id, uint32_t start, uint32_t end) const {
+        const auto & positions = seq_pos[seq_id];
+        if (positions.size() != end) {
+            return false;
+        }
+
+        auto it = positions.lower_bound({pos[start], 0u});
+        for (uint32_t i = start; i < end; ++i, ++it) {
+            if (it == positions.end() || it->second != i || (i > start && pos[i] <= pos[i - 1])) {
+                return false;
+            }
+        }
+        return it == positions.end();
+    }
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);

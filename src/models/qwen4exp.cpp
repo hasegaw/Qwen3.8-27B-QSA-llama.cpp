@@ -1,4 +1,5 @@
 #include "models.h"
+#include "ggml-vulkan.h"
 #include "llama-impl.h"
 #include "llama-ft-moe.h"
 #include "llama-memory-hybrid-idx.h"
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -1041,7 +1043,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
-// Block-sparse attention kernel (CUDA, Q8_0 K/V, head size 256): each query reads its selected
+// Block-sparse attention kernels (head size 256): each query reads its selected
 // blocks straight from the cache. It lets the fast path take prompt batches too.
 // LLAMA_QSA_SPARSE_KERNEL=0 keeps the gather + flash attention path (and its 16-token limit).
 static bool qwen4exp_qsa_sparse_kernel_enabled() {
@@ -1287,6 +1289,9 @@ public:
         // and the row count must come from the same formula as the graph being reused
         res = res && mctx->blk_rebuild() == rebuild;
         res = res && touch_src->ne[0] == n_touch(params.ubatch.n_tokens, (res && rebuild) ? (int64_t) mctx->get_idx()->ubatch_cell0() : 0, ratio, rebuild);
+        if (res && direct_layout.has_value()) {
+            res = *direct_layout == mctx->get_attn()->ubatch_cells_are_causal();
+        }
         if (res && fast) {
             res = vis->ne[1] == params.ubatch.n_tokens && k_idxs->ne[0] == params.ubatch.n_tokens &&
                   sel_mask->ne[3] == params.ubatch.n_tokens;
@@ -1306,6 +1311,7 @@ public:
 
     // graph node, not an input: the visibility bias built from vis, shared by the layers
     ggml_tensor * vis_bias  = nullptr;
+    std::optional<bool> direct_layout;
 
     const llama_memory_hybrid_idx_context * mctx;
     const llama_cparams   cparams;  // [v4bits] a copy: the graph context's cparams live in the caller's llm_graph_params
@@ -1867,7 +1873,71 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         const char * env = getenv("LLAMA_QSA27B_MASKED_PREFILL_MAX");
         return env ? std::max<int64_t>(0, atoll(env)) : int64_t(65536);
     }();
-    if (model.arch == LLM_ARCH_QWEN35 && n_tok > 16 && inp->mctx->get_n_kv() <= masked_prefill_max) {
+    const bool masked_prefill = model.arch == LLM_ARCH_QWEN35 && n_tok > 16 && inp->mctx->get_n_kv() <= masked_prefill_max;
+    const auto dev = model.dev_layer(il);
+    const bool vulkan = strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), GGML_VK_NAME) == 0;
+
+    if (vulkan && cparams.offload_kqv && model.arch == LLM_ARCH_QWEN35 &&
+            qwen4exp_qsa_sparse_kernel_enabled() && !hparams.is_swa(il) && !blk_inp->direct_layout.has_value()) {
+        blk_inp->direct_layout = mctx_cur->ubatch_cells_are_causal();
+    }
+    const bool vulkan_direct = vulkan && !hparams.is_swa(il) && blk_inp->direct_layout.value_or(false);
+
+    ggml_tensor * selected_mask = blk_inp->sel_mask;
+    if (model.arch == LLM_ARCH_QWEN35) {
+        auto * own = ggml_view_2d(ctx0, blk_inp->tail_ids, 1, n_tok, blk_inp->tail_ids->nb[1], 0);
+        auto * delta = ggml_abs(ctx0, ggml_sub(ctx0, ggml_cast(ctx0, top_blk, GGML_TYPE_F32), ggml_cast(ctx0, own, GGML_TYPE_F32)));
+        auto * unique = ggml_step(ctx0, ggml_scale_bias(ctx0, delta, 1.0f, -0.5f));
+        auto * penalty = ggml_scale_bias(ctx0, unique, 1e30f, -1e30f);
+        penalty = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, penalty, 1, top_blk->ne[0], n_tok), r, top_blk->ne[0], n_tok, 1);
+        penalty = ggml_reshape_4d(ctx0, penalty, top_blk->ne[0]*r, 1, 1, n_tok);
+        penalty = ggml_pad(ctx0, penalty, blk_inp->tail_ids->ne[0]*r, 0, 0, 0);
+        selected_mask = ggml_add(ctx0, selected_mask, ggml_cast(ctx0, penalty, GGML_TYPE_F16));
+    }
+
+
+    {
+        ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
+        // Qwen3.8 uses direct attention for decode as well as prompt batches.
+        const bool sparse_ok = qwen4exp_qsa_sparse_kernel_enabled() &&
+            (vulkan ? vulkan_direct : (!masked_prefill && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU)) &&
+            (n_tok > 16 || model.arch == LLM_ARCH_QWEN35) &&
+            (k_all->type == GGML_TYPE_Q8_0 || k_all->type == GGML_TYPE_F16 || (vulkan && k_all->type == GGML_TYPE_Q4_0)) &&
+            v_all->type == k_all->type && k_all->ne[0] == 256 && v_all->ne[0] == 256 &&
+            k_all->ne[3] == 1 && v_all->nb[1] <= v_all->nb[2] && r == 4 && q_cur->type == GGML_TYPE_F32;
+        if (sparse_ok) {
+            // Read each query's selected blocks directly from the KV cache.
+            ggml_tensor * q = ggml_is_contiguous(q_cur) ? q_cur : ggml_cont(ctx0, q_cur);
+            q = ggml_reshape_3d(ctx0, q, q->ne[0], q->ne[1], n_tok);
+            ggml_tensor * k3 = ggml_view_3d(ctx0, k_all, k_all->ne[0], k_all->ne[1], k_all->ne[2], k_all->nb[1], k_all->nb[2], 0);
+            ggml_tensor * v3 = ggml_view_3d(ctx0, v_all, v_all->ne[0], v_all->ne[1], v_all->ne[2], v_all->nb[1], v_all->nb[2], 0);
+            ggml_tensor * out = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 256, q->ne[1], n_tok);
+            // FLASH_ATTN_EXT params: scale, max_bias, softcap, prec; [6] the block size
+            const float   fparams[3] = { kq_scale, 0.0f, 0.0f };
+            const int32_t prec       = GGML_PREC_F32;
+            const int32_t ratio_i32  = (int32_t) r;
+            memcpy((char *) out->op_params + 0*sizeof(int32_t), fparams, sizeof(fparams));
+            memcpy((char *) out->op_params + 3*sizeof(int32_t), &prec, sizeof(prec));
+            memcpy((char *) out->op_params + 6*sizeof(int32_t), &ratio_i32, sizeof(ratio_i32));
+            out->op     = GGML_OP_FLASH_ATTN_EXT;
+            out->src[0] = q;
+            out->src[1] = k3;
+            out->src[2] = v3;
+            out->src[3] = selected_mask;
+            out->src[5] = ids;
+            if (!vulkan || ggml_backend_dev_supports_op(dev, out)) {
+                cb(out, "kqv_out", il);
+                ggml_tensor * cur = ggml_reshape_2d(ctx0, out, 256*q->ne[1], n_tok);
+                if (inp->self_v_rot) {
+                    cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+                }
+                return cur;
+            }
+        }
+    }
+
+    if (masked_prefill) {
         const int64_t nkv = inp->mctx->get_n_kv();
         auto * offsets = ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0, float(r), 1), r, 1, 1);
         auto * starts = ggml_scale(ctx0, ggml_cast(ctx0, ids, GGML_TYPE_F32), float(r));
@@ -1889,59 +1959,6 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
                 nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
         if (inp->self_v_rot) { cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot); }
         return cur;
-    }
-
-    ggml_tensor * selected_mask = blk_inp->sel_mask;
-    if (model.arch == LLM_ARCH_QWEN35) {
-        auto * own = ggml_view_2d(ctx0, blk_inp->tail_ids, 1, n_tok, blk_inp->tail_ids->nb[1], 0);
-        auto * delta = ggml_abs(ctx0, ggml_sub(ctx0, ggml_cast(ctx0, top_blk, GGML_TYPE_F32), ggml_cast(ctx0, own, GGML_TYPE_F32)));
-        auto * unique = ggml_step(ctx0, ggml_scale_bias(ctx0, delta, 1.0f, -0.5f));
-        auto * penalty = ggml_scale_bias(ctx0, unique, 1e30f, -1e30f);
-        penalty = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, penalty, 1, top_blk->ne[0], n_tok), r, top_blk->ne[0], n_tok, 1);
-        penalty = ggml_reshape_4d(ctx0, penalty, top_blk->ne[0]*r, 1, 1, n_tok);
-        penalty = ggml_pad(ctx0, penalty, blk_inp->tail_ids->ne[0]*r, 0, 0, 0);
-        selected_mask = ggml_add(ctx0, selected_mask, ggml_cast(ctx0, penalty, GGML_TYPE_F16));
-    }
-
-
-    {
-        ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
-        ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
-        // decode-sized batches keep the gather + flash attention path (as fast there); prompt batches,
-        // which the gather path cannot take, use the sparse kernel
-        // (q and the cached K/V are already Hadamard-rotated alike when the cache rotates them)
-        const bool sparse_ok = qwen4exp_qsa_sparse_kernel_enabled() &&
-            ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-            (n_tok > 16 || model.arch == LLM_ARCH_QWEN35) &&
-            (k_all->type == GGML_TYPE_Q8_0 || k_all->type == GGML_TYPE_F16) && v_all->type == k_all->type && k_all->ne[0] == 256 && v_all->ne[0] == 256 &&
-            k_all->ne[3] == 1 && v_all->nb[1] <= v_all->nb[2] && r == 4 && q_cur->type == GGML_TYPE_F32;
-        if (sparse_ok) {
-            // block-sparse kernel: reads each query's blocks straight from the Q8_0 cache
-            ggml_tensor * q = ggml_is_contiguous(q_cur) ? q_cur : ggml_cont(ctx0, q_cur);
-            q = ggml_reshape_3d(ctx0, q, q->ne[0], q->ne[1], n_tok);
-            ggml_tensor * k3 = ggml_view_3d(ctx0, k_all, k_all->ne[0], k_all->ne[1], k_all->ne[2], k_all->nb[1], k_all->nb[2], 0);
-            ggml_tensor * v3 = ggml_view_3d(ctx0, v_all, v_all->ne[0], v_all->ne[1], v_all->ne[2], v_all->nb[1], v_all->nb[2], 0);
-            ggml_tensor * out = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 256, q->ne[1], n_tok);
-            // FLASH_ATTN_EXT params: scale, max_bias, softcap, prec; [6] the block size
-            const float   fparams[3] = { kq_scale, 0.0f, 0.0f };
-            const int32_t prec       = GGML_PREC_F32;
-            const int32_t ratio_i32  = (int32_t) r;
-            memcpy((char *) out->op_params + 0*sizeof(int32_t), fparams, sizeof(fparams));
-            memcpy((char *) out->op_params + 3*sizeof(int32_t), &prec, sizeof(prec));
-            memcpy((char *) out->op_params + 6*sizeof(int32_t), &ratio_i32, sizeof(ratio_i32));
-            out->op     = GGML_OP_FLASH_ATTN_EXT;
-            out->src[0] = q;
-            out->src[1] = k3;
-            out->src[2] = v3;
-            out->src[3] = selected_mask;
-            out->src[5] = ids;
-            cb(out, "kqv_out", il);
-            ggml_tensor * cur = ggml_reshape_2d(ctx0, out, 256*q->ne[1], n_tok);
-            if (inp->self_v_rot) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
-            }
-            return cur;
-        }
     }
 
     ids = ggml_reshape_1d(ctx0, ids, n_wblk*n_tok);

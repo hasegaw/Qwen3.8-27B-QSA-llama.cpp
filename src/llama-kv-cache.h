@@ -440,6 +440,7 @@ public:
     // sequence written in order, every cell then holds the token of the same rank, even where positions skip or repeat
     // (an M-RoPE image numbers fewer positions than it has tokens)
     bool ubatch_cells_follow() const;
+    bool ubatch_cells_are_causal() const;
 
     // the cell of the current ubatch's first token
     uint32_t ubatch_cell0() const;
