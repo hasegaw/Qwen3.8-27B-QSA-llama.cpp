@@ -27,7 +27,7 @@ All KV entries remain allocated. QSA reduces attention computation and KV reads;
 
 ### Vulkan host KV
 
-Set `LLAMA_QSA_GPU_KV_TOKENS=N` to keep the target model's attention keys and values in system RAM on a discrete Vulkan GPU. The direct QSA kernel gathers the selected four-token blocks into a device-local buffer. N is the buffer capacity in tokens for one layer, shared across layers. The minimum for this model is 2052. The buffer is refilled for each group of queries. The QSA indexer, recurrent state and DSpine draft cache have separate allocations. Leaving the variable unset or setting it to 0 uses the default placement.
+Set `LLAMA_QSA_GPU_KV_TOKENS=N` to keep the target model's attention keys and values in system RAM on a discrete Vulkan GPU. The direct QSA kernel gathers the selected four-token blocks into a device-local buffer. N is the buffer capacity in tokens for one layer, shared across layers. The minimum for this model is 2052. Within a multi-query dispatch, the GPU reuses pages selected by several queries in the same layer and stream. When the next group would exceed the capacity, gathering restarts with an empty pool. The GPU also uses a temporary table of page IDs and pool indices. The QSA indexer, recurrent state and DSpine draft cache have separate allocations. Leaving the variable unset or setting it to 0 uses the default placement.
 
 ![Architecture of the original Qwen3.8-27B and the QSA adaptation](docs/assets/qsa-architecture-en.png)
 

@@ -3025,6 +3025,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
     }
 
+    ggml_vk_create_pipeline(device, device->pipeline_qsa_page_plan, "qsa_page_plan", qsa_page_plan_len, qsa_page_plan_data, "main", 2, 7 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_qsa_gather_union, "qsa_gather_union", qsa_gather_union_len, qsa_gather_union_data, "main", 5, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_qsa_gather, "qsa_gather", qsa_gather_len, qsa_gather_data, "main", 5, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_qsa_attn_f16, "qsa_attn_f16", qsa_attn_f16_len, qsa_attn_f16_data, "main", 6, sizeof(vk_qsa_attn_push_constants), {1, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_qsa_attn_q8_0, "qsa_attn_q8_0", qsa_attn_q8_0_len, qsa_attn_q8_0_data, "main", 6, sizeof(vk_qsa_attn_push_constants), {1, 1, 1}, {}, 1, true);
@@ -7884,6 +7886,8 @@ static void ggml_vk_qsa_attn(ggml_backend_vk_context * ctx, vk_context & subctx,
     auto values = v_buf;
     const uint32_t budget = ggml_get_op_params_i32(dst, 9);
     uint32_t batch = n_tokens;
+    uint32_t copy_offset = 0;
+    auto packed_ids = ids_buf;
     if (budget) {
         GGML_ASSERT(k->nb[2] == v->nb[2] && k->nb[2] % 4 == 0);
         if (!ctx->qsa_k_pool) {
@@ -7895,23 +7899,48 @@ static void ggml_vk_qsa_attn(ggml_backend_vk_context * ctx, vk_context & subctx,
         }
         keys = ggml_vk_subbuffer(ctx, ctx->qsa_k_pool, 0);
         values = ggml_vk_subbuffer(ctx, ctx->qsa_v_pool, 0);
-        batch = std::min<size_t>(batch, ctx->qsa_k_pool->size / (4 * n_active_blocks * k->nb[2]));
+        const uint32_t capacity = std::min<size_t>(budget / 4, ctx->qsa_k_pool->size / (4 * k->nb[2]));
+        batch = std::min(batch, capacity / n_active_blocks);
         GGML_ASSERT(batch > 0);
         pc.packed = 1;
+
+        const uint32_t kv_blocks = k->ne[2] / 4;
+        const size_t width = size_t(n_blocks) * n_tokens;
+        const size_t plan_size = 2 * (width + kv_blocks) * sizeof(int32_t);
+        if (n_tokens > 1 && plan_size <= ctx->device->properties.limits.maxStorageBufferRange) {
+            if (ctx->prealloc_size_y < plan_size) {
+                ctx->prealloc_size_y = plan_size;
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            ctx->prealloc_y_last_tensor_used = nullptr;
+            packed_ids = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
+            auto & plan = ctx->device->pipeline_qsa_page_plan;
+            const std::array<uint32_t, 7> plan_pc = {n_tokens, n_blocks, n_active_blocks, kv_blocks, capacity, batch, pc.dedup_tail};
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_pipeline_request_descriptor_sets(ctx, plan, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, plan, { ids_buf, packed_ids }, plan_pc, { 1, 1, 1 });
+            copy_offset = width;
+            // The plan contains physical pool slots and has removed duplicate tails.
+            pc.packed = 0;
+            pc.dedup_tail = 0;
+        }
     }
     for (uint32_t first = 0; first < n_tokens; first += batch) {
         const uint32_t count = std::min(batch, n_tokens - first);
         pc.first_query = first;
         if (budget) {
-            const std::array<uint32_t, 6> gather_pc = {first, n_blocks, n_active_blocks, uint32_t(k->ne[2] / 4), uint32_t(4 * k->nb[2] / sizeof(uint32_t)), pc.dedup_tail};
-            auto & gather = ctx->device->pipeline_qsa_gather;
+            const std::array<uint32_t, 6> gather_pc = {first, n_blocks, n_active_blocks, uint32_t(k->ne[2] / 4), uint32_t(4 * k->nb[2] / sizeof(uint32_t)), copy_offset ? copy_offset : pc.dedup_tail};
+            auto & gather = copy_offset ? ctx->device->pipeline_qsa_gather_union : ctx->device->pipeline_qsa_gather;
             ggml_vk_sync_buffers(ctx, subctx);
             ggml_pipeline_request_descriptor_sets(ctx, gather, 1);
-            ggml_vk_dispatch_pipeline(ctx, subctx, gather, { k_buf, v_buf, ids_buf, keys, values }, gather_pc, { n_active_blocks, count, 1 });
+            ggml_vk_dispatch_pipeline(ctx, subctx, gather, { k_buf, v_buf, packed_ids, keys, values }, gather_pc, { n_active_blocks, count, 1 });
             ggml_vk_sync_buffers(ctx, subctx);
         }
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, keys, values, mask_buf, ids_buf, out_buf }, pc, { n_heads, count, n_splits });
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, keys, values, mask_buf, packed_ids, out_buf }, pc, { n_heads, count, n_splits });
+    }
+    if (copy_offset) {
+        ctx->prealloc_y_need_sync = true;
     }
 
     if (n_splits > 1) {
