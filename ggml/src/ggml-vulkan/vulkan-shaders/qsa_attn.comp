@@ -78,6 +78,7 @@ layout(push_constant) uniform parameter {
 const uint HEAD_SIZE = 256;
 const uint BLOCK_CELLS = 4;
 const uint TILE_CELLS = 16;
+const uint TILE_BLOCKS = TILE_CELLS / BLOCK_CELLS;
 const uint DOT_LANES = 8;
 const float NEG_INF = -1.0 / 0.0;
 
@@ -115,22 +116,19 @@ void main() {
     const uint q_offset = q_base + 2 * lane;
     query[lane] = vec2(data_q[q_offset], data_q[q_offset + 1]);
 
+    const uint ids_base = token * p.n_blocks;
     for (uint tile = tile_start; tile < tile_end; ++tile) {
-        if (lane < TILE_CELLS) {
-            const uint slot = tile * TILE_CELLS + lane;
-            int cell = -1;
-            float bias = NEG_INF;
-            if (slot < n_cells) {
-                const int block = data_i[token * p.n_blocks + slot / BLOCK_CELLS];
-                if (block >= 0 && uint(block) < p.n_kv / BLOCK_CELLS) {
-                    bias = float(data_m[token * n_cells + slot]);
-                    if (bias != NEG_INF) {
-                        cell = block * int(BLOCK_CELLS) + int(slot % BLOCK_CELLS);
-                    }
-                }
+        if (lane < TILE_BLOCKS) {
+            const uint block_slot = tile * TILE_BLOCKS + lane;
+            const int block = block_slot < p.n_blocks ? data_i[ids_base + block_slot] : -1;
+            const bool valid_block = block >= 0 && uint(block) < p.n_kv / BLOCK_CELLS;
+            for (uint i = 0; i < BLOCK_CELLS; ++i) {
+                const uint tile_cell = lane * BLOCK_CELLS + i;
+                const uint slot = block_slot * BLOCK_CELLS + i;
+                const float bias = valid_block ? float(data_m[token * n_cells + slot]) : NEG_INF;
+                cells[tile_cell] = bias != NEG_INF ? block * int(BLOCK_CELLS) + int(i) : -1;
+                weights[tile_cell] = bias;
             }
-            cells[lane] = cell;
-            weights[lane] = bias;
         }
         // The first tile barrier also publishes the shared query.
         barrier();
