@@ -7806,7 +7806,11 @@ static bool ggml_vk_qsa_attn_supported(const vk_device & device, const ggml_tens
     }
 
     const auto & limits = device->properties.limits;
-    return q->ne[0] == 256 && k->ne[0] == 256 && v->ne[0] == 256 &&
+    const int32_t n_active_blocks = ggml_get_op_params_i32(dst, 7);
+    const int32_t dedup_tail = ggml_get_op_params_i32(dst, 8);
+    return n_active_blocks >= 0 && n_active_blocks <= ids->ne[0] &&
+           (dedup_tail == 0 || (dedup_tail == 1 && n_active_blocks > 0)) &&
+           q->ne[0] == 256 && k->ne[0] == 256 && v->ne[0] == 256 &&
            q->ne[1] > 0 && q->ne[2] > 0 && k->ne[1] > 0 && q->ne[1] % k->ne[1] == 0 && k->ne[1] == v->ne[1] &&
            k->ne[2] == v->ne[2] && k->ne[2] % 4 == 0 &&
            q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
@@ -7834,13 +7838,16 @@ static void ggml_vk_qsa_attn(ggml_backend_vk_context * ctx, vk_context & subctx,
     const uint32_t n_heads = q->ne[1];
     const uint32_t n_tokens = q->ne[2];
     const uint32_t n_blocks = ids->ne[0];
+    const uint32_t active_blocks = ggml_get_op_params_i32(dst, 7);
+    const uint32_t n_active_blocks = active_blocks > 0 ? active_blocks : n_blocks;
     const uint32_t n_rows = n_heads * n_tokens;
     const uint32_t cores = ctx->device->shader_core_count ? ctx->device->shader_core_count : 64;
     // Give small batches enough workgroups to fill the GPU.
-    const uint32_t max_splits = std::min({32u, 4 * cores / n_rows, n_blocks / 16});
+    const uint32_t max_splits = std::min({32u, 4 * cores / n_rows, n_active_blocks / 16});
     const uint32_t n_splits = std::max(1u, max_splits);
     const vk_qsa_attn_push_constants pc = {
         n_heads, (uint32_t) (q->ne[1] / k->ne[1]), (uint32_t) k->ne[2], n_blocks, n_tokens, n_splits,
+        n_active_blocks, uint32_t(ggml_get_op_params_i32(dst, 8)),
         (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)),
         (uint32_t) (k->nb[1] / kv_unit), (uint32_t) (k->nb[2] / kv_unit),
         (uint32_t) (v->nb[1] / kv_unit), (uint32_t) (v->nb[2] / kv_unit),

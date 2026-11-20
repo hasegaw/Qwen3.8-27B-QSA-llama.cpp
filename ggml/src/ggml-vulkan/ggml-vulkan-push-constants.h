@@ -83,6 +83,7 @@ struct vk_mat_vec_id_push_constants {
 
 struct vk_qsa_attn_push_constants {
     uint32_t n_head, gqa, n_kv, n_blocks, n_tokens, n_splits;
+    uint32_t n_active_blocks, dedup_tail;
     uint32_t q_head_stride, q_token_stride;
     uint32_t k_head_stride, k_cell_stride;
     uint32_t v_head_stride, v_cell_stride;

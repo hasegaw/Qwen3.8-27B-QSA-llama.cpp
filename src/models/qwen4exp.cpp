@@ -1883,8 +1883,10 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
     }
     const bool vulkan_direct = vulkan && !hparams.is_swa(il) && blk_inp->direct_layout.value_or(false);
 
-    ggml_tensor * selected_mask = blk_inp->sel_mask;
-    if (model.arch == LLM_ARCH_QWEN35) {
+    auto build_selected_mask = [&]() -> ggml_tensor * {
+        if (model.arch != LLM_ARCH_QWEN35) {
+            return blk_inp->sel_mask;
+        }
         auto * own = ggml_view_2d(ctx0, blk_inp->tail_ids, 1, n_tok, blk_inp->tail_ids->nb[1], 0);
         auto * delta = ggml_abs(ctx0, ggml_sub(ctx0, ggml_cast(ctx0, top_blk, GGML_TYPE_F32), ggml_cast(ctx0, own, GGML_TYPE_F32)));
         auto * unique = ggml_step(ctx0, ggml_scale_bias(ctx0, delta, 1.0f, -0.5f));
@@ -1892,8 +1894,8 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         penalty = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, penalty, 1, top_blk->ne[0], n_tok), r, top_blk->ne[0], n_tok, 1);
         penalty = ggml_reshape_4d(ctx0, penalty, top_blk->ne[0]*r, 1, 1, n_tok);
         penalty = ggml_pad(ctx0, penalty, blk_inp->tail_ids->ne[0]*r, 0, 0, 0);
-        selected_mask = ggml_add(ctx0, selected_mask, ggml_cast(ctx0, penalty, GGML_TYPE_F16));
-    }
+        return ggml_add(ctx0, blk_inp->sel_mask, ggml_cast(ctx0, penalty, GGML_TYPE_F16));
+    };
 
 
     {
@@ -1916,15 +1918,20 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
             // FLASH_ATTN_EXT params: scale, max_bias, softcap, prec; [6] the block size
             const float   fparams[3] = { kq_scale, 0.0f, 0.0f };
             const int32_t prec       = GGML_PREC_F32;
-            const int32_t ratio_i32  = (int32_t) r;
+            // Vulkan uses the padded mask stride but visits only selected blocks and the tail.
+            const int32_t block_params[] = {
+                int32_t(r),
+                vulkan ? int32_t(top_blk->ne[0] + 1) : 0,
+                vulkan && model.arch == LLM_ARCH_QWEN35 ? 1 : 0,
+            };
             memcpy((char *) out->op_params + 0*sizeof(int32_t), fparams, sizeof(fparams));
             memcpy((char *) out->op_params + 3*sizeof(int32_t), &prec, sizeof(prec));
-            memcpy((char *) out->op_params + 6*sizeof(int32_t), &ratio_i32, sizeof(ratio_i32));
+            memcpy((char *) out->op_params + 6*sizeof(int32_t), block_params, sizeof(block_params));
             out->op     = GGML_OP_FLASH_ATTN_EXT;
             out->src[0] = q;
             out->src[1] = k3;
             out->src[2] = v3;
-            out->src[3] = selected_mask;
+            out->src[3] = vulkan ? blk_inp->sel_mask : build_selected_mask();
             out->src[5] = ids;
             if (!vulkan || ggml_backend_dev_supports_op(dev, out)) {
                 cb(out, "kqv_out", il);
@@ -1983,7 +1990,7 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
 
     ggml_tensor * k = gather(mctx_cur->get_k(ctx0, il));
     ggml_tensor * v = gather(v_all);
-    ggml_tensor * m = selected_mask;
+    ggml_tensor * m = build_selected_mask();
 
     // build_attn_mha splits q into k->ne[3] == n_tok streams: one query per stream
     ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, m, nullptr, nullptr, 0, kq_scale, il);

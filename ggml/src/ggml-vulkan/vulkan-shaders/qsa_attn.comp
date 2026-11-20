@@ -66,6 +66,8 @@ layout(push_constant) uniform parameter {
     uint n_blocks;
     uint n_tokens;
     uint n_splits;
+    uint n_active_blocks;
+    uint dedup_tail;
     uint q_head_stride;
     uint q_token_stride;
     uint k_head_stride;
@@ -103,7 +105,7 @@ void main() {
     const uint dot_lane = lane % DOT_LANES;
     const uint n_cells = p.n_blocks * BLOCK_CELLS;
 
-    const uint n_tiles = (n_cells + TILE_CELLS - 1) / TILE_CELLS;
+    const uint n_tiles = (p.n_active_blocks + TILE_BLOCKS - 1) / TILE_BLOCKS;
     const uint tile_start = split * n_tiles / p.n_splits;
     const uint tile_end = (split + 1) * n_tiles / p.n_splits;
 
@@ -117,11 +119,14 @@ void main() {
     query[lane] = vec2(data_q[q_offset], data_q[q_offset + 1]);
 
     const uint ids_base = token * p.n_blocks;
+    const int tail_block = p.dedup_tail != 0 && lane < TILE_BLOCKS ?
+                           data_i[ids_base + p.n_active_blocks - 1] : -1;
     for (uint tile = tile_start; tile < tile_end; ++tile) {
         if (lane < TILE_BLOCKS) {
             const uint block_slot = tile * TILE_BLOCKS + lane;
-            const int block = block_slot < p.n_blocks ? data_i[ids_base + block_slot] : -1;
-            const bool valid_block = block >= 0 && uint(block) < p.n_kv / BLOCK_CELLS;
+            const int block = block_slot < p.n_active_blocks ? data_i[ids_base + block_slot] : -1;
+            const bool duplicate_tail = block == tail_block && block_slot + 1 < p.n_active_blocks;
+            const bool valid_block = block >= 0 && uint(block) < p.n_kv / BLOCK_CELLS && !duplicate_tail;
             for (uint i = 0; i < BLOCK_CELLS; ++i) {
                 const uint tile_cell = lane * BLOCK_CELLS + i;
                 const uint slot = block_slot * BLOCK_CELLS + i;
