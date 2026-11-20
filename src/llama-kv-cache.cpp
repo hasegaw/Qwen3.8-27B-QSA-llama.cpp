@@ -1,3 +1,4 @@
+#include <charconv>
 #include "llama-kv-cache.h"
 
 #include "llama-impl.h"
@@ -97,6 +98,15 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    const char * budget = getenv("LLAMA_QSA_GPU_KV_TOKENS");
+    if (budget && model.arch == LLM_ARCH_QWEN35 && model.hparams.indexer_head_size && name_tag[0] == 0) {
+        const char * end = budget + strlen(budget);
+        auto parsed = std::from_chars(budget, end, qsa_gpu_tokens);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || qsa_gpu_tokens > INT32_MAX ||
+            (qsa_gpu_tokens && (qsa_gpu_tokens < model.hparams.indexer_top_k + 4 || !offload))) {
+            throw std::runtime_error("LLAMA_QSA_GPU_KV_TOKENS requires Vulkan KV offload and room for top-k plus one four-token tail");
+        }
+    }
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
@@ -218,6 +228,14 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+            if (qsa_gpu_tokens) {
+                using get_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+                auto get_type = (get_type_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_vk_qsa_ram_type");
+                if (!get_type) {
+                    throw std::runtime_error("host QSA KV requires a Vulkan attention layer");
+                }
+                buft = get_type(dev);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

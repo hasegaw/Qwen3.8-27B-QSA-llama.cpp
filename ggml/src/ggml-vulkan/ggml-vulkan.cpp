@@ -3025,6 +3025,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
     }
 
+    ggml_vk_create_pipeline(device, device->pipeline_qsa_gather, "qsa_gather", qsa_gather_len, qsa_gather_data, "main", 5, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_qsa_attn_f16, "qsa_attn_f16", qsa_attn_f16_len, qsa_attn_f16_data, "main", 6, sizeof(vk_qsa_attn_push_constants), {1, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_qsa_attn_q8_0, "qsa_attn_q8_0", qsa_attn_q8_0_len, qsa_attn_q8_0_data, "main", 6, sizeof(vk_qsa_attn_push_constants), {1, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_qsa_attn_q4_0, "qsa_attn_q4_0", qsa_attn_q4_0_len, qsa_attn_q4_0_data, "main", 6, sizeof(vk_qsa_attn_push_constants), {1, 1, 1}, {}, 1, true);
@@ -4688,6 +4689,9 @@ vk_device ggml_vk_get_device(size_t idx) {
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
         };
+
+        device->qsa_ram_type = device->buffer_type;
+        device->qsa_ram_name = device->name + "_QSA_RAM";
 
         device->fence = device->device.createFence({});
 
@@ -7808,6 +7812,9 @@ static bool ggml_vk_qsa_attn_supported(const vk_device & device, const ggml_tens
     const auto & limits = device->properties.limits;
     const int32_t n_active_blocks = ggml_get_op_params_i32(dst, 7);
     const int32_t dedup_tail = ggml_get_op_params_i32(dst, 8);
+    if (ggml_get_op_params_i32(dst, 9) && (!ggml_is_contiguous(k) || !ggml_is_contiguous(v) || k->nb[2] % sizeof(uint32_t))) {
+        return false;
+    }
     return n_active_blocks >= 0 && n_active_blocks <= ids->ne[0] &&
            (dedup_tail == 0 || (dedup_tail == 1 && n_active_blocks > 0)) &&
            q->ne[0] == 256 && k->ne[0] == 256 && v->ne[0] == 256 &&
@@ -7845,9 +7852,9 @@ static void ggml_vk_qsa_attn(ggml_backend_vk_context * ctx, vk_context & subctx,
     // Give small batches enough workgroups to fill the GPU.
     const uint32_t max_splits = std::min({32u, 4 * cores / n_rows, n_active_blocks / 16});
     const uint32_t n_splits = std::max(1u, max_splits);
-    const vk_qsa_attn_push_constants pc = {
+    vk_qsa_attn_push_constants pc = {
         n_heads, (uint32_t) (q->ne[1] / k->ne[1]), (uint32_t) k->ne[2], n_blocks, n_tokens, n_splits,
-        n_active_blocks, uint32_t(ggml_get_op_params_i32(dst, 8)),
+        n_active_blocks, uint32_t(ggml_get_op_params_i32(dst, 8)), 0, 0,
         (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)),
         (uint32_t) (k->nb[1] / kv_unit), (uint32_t) (k->nb[2] / kv_unit),
         (uint32_t) (v->nb[1] / kv_unit), (uint32_t) (v->nb[2] / kv_unit),
@@ -7868,16 +7875,44 @@ static void ggml_vk_qsa_attn(ggml_backend_vk_context * ctx, vk_context & subctx,
         out_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
     }
 
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     const auto q_buf = ggml_vk_tensor_subbuffer(ctx, q);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
-        q_buf,
-        ggml_vk_tensor_subbuffer(ctx, k),
-        ggml_vk_tensor_subbuffer(ctx, v),
-        ggml_vk_tensor_subbuffer(ctx, mask),
-        ggml_vk_tensor_subbuffer(ctx, ids),
-        out_buf,
-    }, pc, { n_heads, n_tokens, n_splits });
+    const auto ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
+    const auto mask_buf = ggml_vk_tensor_subbuffer(ctx, mask);
+    const auto k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    const auto v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    auto keys = k_buf;
+    auto values = v_buf;
+    const uint32_t budget = ggml_get_op_params_i32(dst, 9);
+    uint32_t batch = n_tokens;
+    if (budget) {
+        GGML_ASSERT(k->nb[2] == v->nb[2] && k->nb[2] % 4 == 0);
+        if (!ctx->qsa_k_pool) {
+            const size_t bytes = std::min<size_t>(size_t(budget) * k->nb[2], ctx->device->properties.limits.maxStorageBufferRange);
+            const auto local = vk::MemoryPropertyFlagBits::eDeviceLocal;
+            ctx->qsa_k_pool = ggml_vk_create_buffer_check(ctx->device, bytes, local, local);
+            ctx->qsa_v_pool = ggml_vk_create_buffer_check(ctx->device, bytes, local, local);
+            GGML_LOG_INFO("Vulkan QSA shared KV pool: %zu bytes K+V, %u tokens requested\n", 2 * bytes, budget);
+        }
+        keys = ggml_vk_subbuffer(ctx, ctx->qsa_k_pool, 0);
+        values = ggml_vk_subbuffer(ctx, ctx->qsa_v_pool, 0);
+        batch = std::min<size_t>(batch, ctx->qsa_k_pool->size / (4 * n_active_blocks * k->nb[2]));
+        GGML_ASSERT(batch > 0);
+        pc.packed = 1;
+    }
+    for (uint32_t first = 0; first < n_tokens; first += batch) {
+        const uint32_t count = std::min(batch, n_tokens - first);
+        pc.first_query = first;
+        if (budget) {
+            const std::array<uint32_t, 6> gather_pc = {first, n_blocks, n_active_blocks, uint32_t(k->ne[2] / 4), uint32_t(4 * k->nb[2] / sizeof(uint32_t)), pc.dedup_tail};
+            auto & gather = ctx->device->pipeline_qsa_gather;
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_pipeline_request_descriptor_sets(ctx, gather, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, gather, { k_buf, v_buf, ids_buf, keys, values }, gather_pc, { n_active_blocks, count, 1 });
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, keys, values, mask_buf, ids_buf, out_buf }, pc, { n_heads, count, n_splits });
+    }
 
     if (n_splits > 1) {
         ggml_vk_sync_buffers(ctx, subctx);
@@ -12693,6 +12728,8 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ggml_vk_graph_cleanup(ctx);
 
+    ggml_vk_destroy_buffer(ctx->qsa_k_pool);
+    ggml_vk_destroy_buffer(ctx->qsa_v_pool);
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
@@ -12871,7 +12908,7 @@ void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
 const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
 
-    return ctx->name.c_str();
+    return buft == &ctx->device->qsa_ram_type ? ctx->device->qsa_ram_name.c_str() : ctx->name.c_str();
 }
 
 ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -12880,12 +12917,16 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
 
     vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        if (buft == &ctx->device->qsa_ram_type) {
+            dev_buffer = ggml_vk_create_buffer_host_kv(ctx->device, size);
+        } else {
+            dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        }
     } catch (const vk::SystemError& e) {
         return nullptr;
     }
 
-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ggml_backend_vk_buffer_type_name(buft));
 
     return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
 }
@@ -13008,7 +13049,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == &ctx->device->qsa_ram_type || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -13071,7 +13112,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == &ctx->device->qsa_ram_type || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -15966,11 +16007,20 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static ggml_backend_buffer_type_t ggml_vk_qsa_ram_type(ggml_backend_dev_t dev) {
+    auto * ctx = (ggml_backend_vk_device_context *) dev->context;
+    return &ggml_vk_get_device(ctx->device)->qsa_ram_type;
+}
+
+static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t, const char * name) {
+    return strcmp(name, "ggml_vk_qsa_ram_type") == 0 ? (void *) ggml_vk_qsa_ram_type : nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

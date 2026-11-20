@@ -25,6 +25,10 @@ Qwen Sparse Attention (QSA) uses a learned, compressed indexer to select context
 
 All KV entries remain allocated. QSA reduces attention computation and KV reads; it does not compress the KV cache. The native engine supports text, images, and video with M-RoPE, MTP with up to two draft tokens, and target/indexer/MTP cache reuse in one live slot. The cache is not stored on disk and does not survive a server restart.
 
+### Vulkan host KV
+
+Set `LLAMA_QSA_GPU_KV_TOKENS=N` to keep the target model's attention keys and values in system RAM on a discrete Vulkan GPU. The direct QSA kernel gathers the selected four-token blocks into a device-local buffer. N is the buffer capacity in tokens for one layer, shared across layers. The minimum for this model is 2052. The buffer is refilled for each group of queries. The QSA indexer, recurrent state and DSpine draft cache have separate allocations. Leaving the variable unset or setting it to 0 uses the default placement.
+
 ![Architecture of the original Qwen3.8-27B and the QSA adaptation](docs/assets/qsa-architecture-en.png)
 
 Original Qwen3.8-27B (left) and the QSA adaptation with 16 learned indexers (right).
