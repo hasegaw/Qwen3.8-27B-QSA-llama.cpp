@@ -1,0 +1,107 @@
+#version 450
+
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer Ids { int ids[]; };
+// Remapped IDs, pages to copy, most recent owner, and resident slot tag.
+layout(binding = 1) coherent buffer Plan { int data[]; };
+
+layout(push_constant) uniform Params {
+    uint queries;
+    uint stride;
+    uint active_blocks;
+    uint kv_blocks;
+    uint capacity;
+    uint batch;
+    uint dedup_tail;
+} p;
+
+shared uint group_base;
+shared uint used;
+shared uint missing;
+shared uint previous_end;
+
+int selected(uint i) {
+    uint query = i / p.active_blocks;
+    uint slot = i % p.active_blocks;
+    uint start = query * p.stride;
+    int page = ids[start + slot];
+    if (page < 0 || uint(page) >= p.kv_blocks) {
+        return -1;
+    }
+    if (p.dedup_tail != 0 && slot + 1 < p.active_blocks && page == ids[start + p.active_blocks - 1]) {
+        return -1;
+    }
+    return page;
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex;
+    const uint width = p.stride * p.queries;
+    const uint owners = 2 * width;
+    const uint tags = owners + p.kv_blocks;
+    for (uint page = lane; page < p.kv_blocks; page += gl_WorkGroupSize.x) {
+        data[owners + page] = -1;
+        data[tags + page] = 0;
+    }
+    if (lane == 0) {
+        group_base = 0;
+        used = 0;
+    }
+    groupMemoryBarrier();
+    barrier();
+
+    for (uint first = 0; first < p.queries; first += p.batch) {
+        uint begin = first * p.active_blocks;
+        uint end = min(first + p.batch, p.queries) * p.active_blocks;
+        if (lane == 0) {
+            missing = 0;
+        }
+        for (uint i = begin + lane; i < end; i += gl_WorkGroupSize.x) {
+            int page = selected(i);
+            if (page >= 0) {
+                atomicMax(data[owners + page], int(i));
+            }
+        }
+        groupMemoryBarrier();
+        barrier();
+
+        uint new_pages = 0;
+        for (uint i = begin + lane; i < end; i += gl_WorkGroupSize.x) {
+            int page = selected(i);
+            if (page >= 0 && data[owners + page] == int(i) && uint(data[tags + page]) <= group_base) {
+                ++new_pages;
+            }
+        }
+        atomicAdd(missing, new_pages);
+        barrier();
+
+        // A new group can reuse the pool after the preceding attention dispatch.
+        if (lane == 0) {
+            if (used + missing > p.capacity) {
+                group_base += used;
+                used = 0;
+            }
+            previous_end = group_base + used;
+        }
+        barrier();
+
+        for (uint i = begin + lane; i < end; i += gl_WorkGroupSize.x) {
+            int page = selected(i);
+            if (page >= 0 && data[owners + page] == int(i) && uint(data[tags + page]) <= group_base) {
+                data[tags + page] = int(group_base + atomicAdd(used, 1) + 1);
+            }
+        }
+        groupMemoryBarrier();
+        barrier();
+
+        for (uint i = begin + lane; i < end; i += gl_WorkGroupSize.x) {
+            int page = selected(i);
+            uint dst = (i / p.active_blocks) * p.stride + i % p.active_blocks;
+            uint tag = page >= 0 ? uint(data[tags + page]) : 0;
+            data[dst] = page >= 0 ? int(tag - group_base - 1) : -1;
+            data[width + dst] = page >= 0 && tag > previous_end && data[owners + page] == int(i) ? page : -1;
+        }
+        groupMemoryBarrier();
+        barrier();
+    }
+}

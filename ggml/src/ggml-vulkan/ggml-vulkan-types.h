@@ -991,6 +991,8 @@ struct vk_device_struct {
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
+    vk_pipeline pipeline_qsa_page_plan;
+    vk_pipeline pipeline_qsa_gather_union;
     vk_pipeline pipeline_qsa_gather;
     vk_pipeline pipeline_qsa_attn_f16;
     vk_pipeline pipeline_qsa_attn_q8_0;

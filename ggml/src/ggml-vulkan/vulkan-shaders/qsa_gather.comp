@@ -13,13 +13,24 @@ layout(push_constant) uniform Params {
     uint active_blocks;
     uint kv_blocks;
     uint words_per_block;
+#ifdef PAGE_PLAN
+    uint copy_offset;
+#else
     uint dedup_tail;
+#endif
 } p;
 
 void main() {
     uint query = gl_WorkGroupID.y;
     uint slot = gl_WorkGroupID.x;
     uint base = (p.first_query + query) * p.ids_stride;
+#ifdef PAGE_PLAN
+    int page = ids[p.copy_offset + base + slot];
+    if (page < 0) {
+        return;
+    }
+    uint pool_slot = uint(ids[base + slot]);
+#else
     int page = ids[base + slot];
     if (page < 0 || uint(page) >= p.kv_blocks) {
         return;
@@ -27,8 +38,10 @@ void main() {
     if (p.dedup_tail != 0 && slot + 1 < p.active_blocks && page == ids[base + p.active_blocks - 1]) {
         return;
     }
+    uint pool_slot = query * p.active_blocks + slot;
+#endif
     uint src = uint(page) * p.words_per_block;
-    uint dst = (query * p.active_blocks + slot) * p.words_per_block;
+    uint dst = pool_slot * p.words_per_block;
     for (uint i = gl_LocalInvocationIndex; i < p.words_per_block; i += gl_WorkGroupSize.x) {
         packed_k[dst + i] = k[src + i];
         packed_v[dst + i] = v[src + i];
