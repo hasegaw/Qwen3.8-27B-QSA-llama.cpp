@@ -20,6 +20,7 @@ layout (push_constant) uniform parameter {
 } p;
 
 shared float tmpsh[BLOCK_SIZE];
+shared float split_weights[BLOCK_SIZE];
 
 void main() {
     // Each workgroup handles a row
@@ -56,12 +57,17 @@ void main() {
 
     barrier();
 
-    // Compute L based on m_max
+    // The normalization and output lanes can share one weight per split.
+    const bool cache_weights = k_num <= BLOCK_SIZE;
     float L = 0;
     for (uint k = 0; k + tid < k_num; k += BLOCK_SIZE) {
         float l = data_a[l_offset + (k + tid) * lm_stride];
         float m = data_a[m_offset + (k + tid) * lm_stride];
-        L += exp(m - m_max) * l;
+        const float weight = exp(m - m_max);
+        if (cache_weights) {
+            split_weights[k + tid] = weight;
+        }
+        L += weight * l;
     }
 
     // reduce across the workgroup
@@ -101,8 +107,8 @@ void main() {
         float O = 0.0;
         [[unroll]] for (uint k = 0; k < k_num; ++k) {
             uint o_offset = D * p.ne1 * (k + p.k_num * (i2 + p.ne2 * i3)) + D * n + d;
-            float m = data_a[m_offset + k * lm_stride];
-            O += exp(m - m_max) * data_a[o_offset];
+            const float weight = cache_weights ? split_weights[k] : exp(data_a[m_offset + k * lm_stride] - m_max);
+            O += weight * data_a[o_offset];
         }
         if (p.sinks != 0) {
             if (sink > m_max) {
