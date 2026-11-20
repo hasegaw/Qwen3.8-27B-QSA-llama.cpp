@@ -1194,7 +1194,7 @@ public:
     virtual ~llm_graph_input_qsa_blk() = default;
 
     static int64_t n_touch(int64_t n_tokens, uint32_t ratio) {
-        return (n_tokens + ratio - 1)/ratio + 1;
+        return n_tokens == 1 ? 1 : (n_tokens + ratio - 1)/ratio + 1;
     }
 
     // [blk-rebuild] rows re-pooled by one ubatch whose first token sits in cell c0: the blocks it touches, or with rebuild every
