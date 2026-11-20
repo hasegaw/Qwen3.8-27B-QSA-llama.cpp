@@ -926,6 +926,7 @@ void process_shaders() {
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
 
+    string_to_spv("qsa_gather", "qsa_gather.comp", {});
     string_to_spv("qsa_attn_f16", "qsa_attn.comp", {});
     string_to_spv("qsa_attn_q8_0", "qsa_attn.comp", {{"DATA_A_Q8_0", "1"}});
     string_to_spv("qsa_attn_q4_0", "qsa_attn.comp", {{"DATA_A_Q4_0", "1"}});

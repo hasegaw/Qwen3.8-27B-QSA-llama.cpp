@@ -1923,6 +1923,7 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
                 int32_t(r),
                 vulkan ? int32_t(top_blk->ne[0] + 1) : 0,
                 vulkan && model.arch == LLM_ARCH_QWEN35 ? 1 : 0,
+                vulkan ? int32_t(mctx_cur->get_qsa_gpu_tokens()) : 0,
             };
             memcpy((char *) out->op_params + 0*sizeof(int32_t), fparams, sizeof(fparams));
             memcpy((char *) out->op_params + 3*sizeof(int32_t), &prec, sizeof(prec));

@@ -162,6 +162,7 @@ public:
     // llama_kv_cache specific API
     //
 
+    uint32_t qsa_gpu_tokens = 0;
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
@@ -439,6 +440,7 @@ public:
     // true when the current ubatch sits in stream 0, in the consecutive cells right after all used ones. With one
     // sequence written in order, every cell then holds the token of the same rank, even where positions skip or repeat
     // (an M-RoPE image numbers fewer positions than it has tokens)
+    uint32_t get_qsa_gpu_tokens() const { return kv->qsa_gpu_tokens; }
     bool ubatch_cells_follow() const;
     bool ubatch_cells_are_causal() const;
 

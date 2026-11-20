@@ -68,6 +68,8 @@ layout(push_constant) uniform parameter {
     uint n_splits;
     uint n_active_blocks;
     uint dedup_tail;
+    uint first_query;
+    uint packed;
     uint q_head_stride;
     uint q_token_stride;
     uint k_head_stride;
@@ -94,7 +96,7 @@ shared float total;
 // One workgroup per query token and head.
 void main() {
     const uint head = gl_WorkGroupID.x;
-    const uint token = gl_WorkGroupID.y;
+    const uint token = p.first_query + gl_WorkGroupID.y;
     const uint split = gl_WorkGroupID.z;
     const uint lane = gl_LocalInvocationIndex;
     const uint kv_head = head / p.gqa;
@@ -131,7 +133,8 @@ void main() {
                 const uint tile_cell = lane * BLOCK_CELLS + i;
                 const uint slot = block_slot * BLOCK_CELLS + i;
                 const float bias = valid_block ? float(data_m[token * n_cells + slot]) : NEG_INF;
-                cells[tile_cell] = bias != NEG_INF ? block * int(BLOCK_CELLS) + int(i) : -1;
+                const int page = p.packed != 0 ? int(gl_WorkGroupID.y * p.n_active_blocks + block_slot) : block;
+                cells[tile_cell] = bias != NEG_INF ? page * int(BLOCK_CELLS) + int(i) : -1;
                 weights[tile_cell] = bias;
             }
         }

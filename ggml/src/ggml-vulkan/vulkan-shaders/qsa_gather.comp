@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer Keys { uint k[]; };
+layout(binding = 1) readonly buffer Values { uint v[]; };
+layout(binding = 2) readonly buffer Ids { int ids[]; };
+layout(binding = 3) writeonly buffer PackedKeys { uint packed_k[]; };
+layout(binding = 4) writeonly buffer PackedValues { uint packed_v[]; };
+
+layout(push_constant) uniform Params {
+    uint first_query;
+    uint ids_stride;
+    uint active_blocks;
+    uint kv_blocks;
+    uint words_per_block;
+    uint dedup_tail;
+} p;
+
+void main() {
+    uint query = gl_WorkGroupID.y;
+    uint slot = gl_WorkGroupID.x;
+    uint base = (p.first_query + query) * p.ids_stride;
+    int page = ids[base + slot];
+    if (page < 0 || uint(page) >= p.kv_blocks) {
+        return;
+    }
+    if (p.dedup_tail != 0 && slot + 1 < p.active_blocks && page == ids[base + p.active_blocks - 1]) {
+        return;
+    }
+    uint src = uint(page) * p.words_per_block;
+    uint dst = (query * p.active_blocks + slot) * p.words_per_block;
+    for (uint i = gl_LocalInvocationIndex; i < p.words_per_block; i += gl_WorkGroupSize.x) {
+        packed_k[dst + i] = k[src + i];
+        packed_v[dst + i] = v[src + i];
+    }
+}

@@ -991,6 +991,7 @@ struct vk_device_struct {
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
+    vk_pipeline pipeline_qsa_gather;
     vk_pipeline pipeline_qsa_attn_f16;
     vk_pipeline pipeline_qsa_attn_q8_0;
     vk_pipeline pipeline_qsa_attn_q4_0;
@@ -1012,7 +1013,8 @@ struct vk_device_struct {
     vk::Fence fence;
     vk_buffer sync_staging;
 
-    ggml_backend_buffer_type buffer_type;
+    ggml_backend_buffer_type buffer_type, qsa_ram_type;
+    std::string qsa_ram_name;
 
     bool disable_fusion;
     bool disable_host_visible_vidmem;
@@ -1234,6 +1236,7 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    vk_buffer qsa_k_pool, qsa_v_pool;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -1303,7 +1306,7 @@ struct ggml_backend_vk_buffer_context {
     vk_buffer dev_buffer;
     std::string name;
 
-    ggml_backend_vk_buffer_context(vk_device_ref device, vk_buffer&& dev_buffer, std::string& name) :
+    ggml_backend_vk_buffer_context(vk_device_ref device, vk_buffer&& dev_buffer, const std::string& name) :
         device(device),
         dev_buffer(dev_buffer),
         name(name) {
