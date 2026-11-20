@@ -379,6 +379,9 @@ struct llama_layer {
     struct ggml_tensor * dflash_attn_conv_proj = nullptr;
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
+    struct ggml_tensor * dspine_read  = nullptr;
+    struct ggml_tensor * dspine_write = nullptr;
+
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -697,6 +700,13 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
+    // DSpine code bridge
+    struct ggml_tensor * dspine_codebook  = nullptr;
+    struct ggml_tensor * dspine_gate      = nullptr;
+    struct ggml_tensor * dspine_gate_b    = nullptr;
+    struct ggml_tensor * dspine_pred_gate = nullptr;
+    struct ggml_tensor * dspine_prev      = nullptr;
+
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;

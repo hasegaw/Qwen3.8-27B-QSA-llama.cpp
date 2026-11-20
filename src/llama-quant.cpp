@@ -361,6 +361,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("a.rvq.codebook")  == std::string::npos;
     quantize &= name.find("mm.a.code_embd")  == std::string::npos;
 
+    // dspine: the code bridge projections are small and steer every draft row, keep them accurate
+    if (arch == LLM_ARCH_DFLASH) {
+        quantize &= name.find("dspine_") == std::string::npos || name.find("dspine_codebook") != std::string::npos;
+    }
+
     return quantize;
 }
 
